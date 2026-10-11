@@ -6,6 +6,17 @@ rem START-HERE.bat. Options are passed on to setup.py.
 setlocal
 title Strata - update
 cd /d "%~dp0"
+rem Video updates deliberately avoid the legacy history-reset fallback below.
+rem This mode accepts no setup options; use BUILD-VIDEO.ps1 directly for build options.
+if /i "%~1"=="--video" (
+  if not "%~2"=="" (
+    echo  Usage: UPDATE.bat --video
+    exit /b 1
+  )
+  powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0BUILD-VIDEO.ps1" -Update
+  if errorlevel 1 exit /b 1
+  exit /b 0
+)
 rem All of it in one block: cmd reads a .bat file while it runs it, and the git pull can change this very file.
 (
   if exist ".git" (

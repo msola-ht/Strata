@@ -1533,6 +1533,31 @@ Video is off unless the existing `vision` config contains this entry:
 Install FFmpeg and FFprobe on the serving host, or set their executable paths above. Rebuild `strata-vision` using
 the same pinned llama.cpp revision as the current engine (`3cf03257f219afbe7334045ff7c6a06ac68c627d`):
 
+On Windows, run `./BUILD-VIDEO.ps1` in PowerShell (`-Cpu` for CPU encoding, `-Jobs 4` to limit build parallelism).
+The script loads the Visual Studio 2022 x64 developer environment, checks MSVC and Windows SDK tools, checks CUDA
+for GPU builds, obtains the pinned dependency and builds the encoder. Install the C++ desktop workload, Windows
+SDK, Git, CMake, Ninja and, for GPU builds, CUDA Toolkit first. It reuses `third_party/llama-video` when present;
+otherwise the dependency goes under the ignored build directory. `-LlamaDir` selects another checkout, whose
+commit and tracked changes are checked without resetting it. `-VsPath` selects another compatible Visual Studio
+installation. Do not run it concurrently with another build in the same output directory. A failed configure or
+build stops the script. It does not install tools, edit model settings, replace the running encoder or restart
+Strata. Point `vision.exe` at the printed output path after a successful build. Windows execution still requires
+validation on a Windows host.
+
+To update the current tracked branch and build the GPU video encoder together, close the running Strata service
+and run `./UPDATE.bat --video`. This mode accepts no additional arguments. It runs `git pull --ff-only`, the usual
+installer update, then the video build; a failed step stops the command with a nonzero exit code. It stops before
+updating if tracked files have local changes; it does not stash or discard them. It never uses
+the ordinary updater's legacy fallback that moves old Git history to `origin/main`. Set the video branch's
+tracking remote first (for example `fork/codex-responses-video`). The installer may update Python packages, the
+prebuilt engine and model settings as usual; its intermediate "updated" message does not mean the video build
+has succeeded. The final build message prints the encoder path, which you must select in `vision.exe`, and video
+must still be enabled explicitly. Plain `UPDATE.bat` keeps the existing update behavior. For CPU encoding or
+custom build options, use `./BUILD-VIDEO.ps1 -Update -Cpu` or `-Update` with the required build options; this uses
+the same protected Git update path.
+
+For a manual build:
+
 ```sh
 cmake -S tools/vision -B build-vision -G Ninja -DCMAKE_BUILD_TYPE=Release -DLLAMA_DIR=/path/to/llama.cpp
 cmake --build build-vision --target strata-vision
