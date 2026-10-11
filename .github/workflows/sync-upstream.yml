@@ -11,7 +11,7 @@ name: sync-upstream
 
 on:
   schedule:
-    - cron: "23 * * * *"                  # hourly; GitHub starts scheduled runs late under load, that is fine
+    - cron: "7,22,37,52 * * * *"           # every 15 minutes; GitHub may delay or drop scheduled runs
   workflow_dispatch:                      # or by hand: Actions -> sync-upstream -> Run workflow
     inputs:
       branches:
@@ -31,11 +31,16 @@ env:
   PATCH_BRANCHES: codex-tool-search       # the branches carrying this fork's own commits
 
 jobs:
-  sync:
+  sync-main:
+    name: Sync main with upstream
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      main_sha: ${{ steps.sync.outputs.main_sha }}
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: main
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
@@ -48,8 +53,11 @@ jobs:
           echo "upstream/main = $(git rev-parse --short upstream/main)"
 
       - name: bring main up to upstream
+        id: sync
         run: |
           git checkout main
+          before=$(git rev-parse HEAD)
+          upstream=$(git rev-parse upstream/main)
           # A plain merge: a fast-forward while this fork's main holds nothing upstream does not, and a merge
           # commit once it holds this file too. Upstream history that shares no commit with ours (the 2026-10-06
           # cleanup, #1276) stops here on purpose: that one is a by-hand job.
@@ -58,28 +66,63 @@ jobs:
             exit 1
           fi
           git push origin main
+          after=$(git rev-parse HEAD)
+          git fetch origin main
+          git merge-base --is-ancestor "$after" origin/main
+          git merge-base --is-ancestor "$upstream" origin/main
+          echo "main_sha=$after" >> "$GITHUB_OUTPUT"
+          {
+            echo "### main synced"
+            echo "Before: $before"
+            echo "Upstream fetched: $upstream"
+            echo "After: $after"
+            echo "Verified: origin/main contains the fetched upstream commit."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  replay-patches:
+    name: Replay patch branches
+    needs: sync-main
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: replay the patch branches on main
         env:
           BRANCHES: ${{ inputs.branches }}
+          SYNCED_MAIN: ${{ needs.sync-main.outputs.main_sha }}
         run: |
-          set -u
-          for branch in ${BRANCHES:-$PATCH_BRANCHES}; do
+          set -euo pipefail
+          git config user.name "strata-sync"
+          git config user.email "strata-sync@users.noreply.github.com"
+          git rev-parse --verify "$SYNCED_MAIN^{commit}"
+          read -r -a branches <<< "${BRANCHES:-$PATCH_BRANCHES}"
+          for branch in "${branches[@]}"; do
+            git check-ref-format "refs/heads/$branch"
+            if [[ "$branch" == main || "$branch" == -* ]]; then
+              echo "::error::only patch branches may be replayed"
+              exit 1
+            fi
             echo "== $branch"
-            git checkout "$branch" || exit 1
-            old=$(git rev-parse HEAD)
-            if ! git rebase main; then
+            git fetch origin "refs/heads/$branch:refs/remotes/origin/$branch"
+            old=$(git rev-parse "refs/remotes/origin/$branch")
+            git checkout --detach "$old"
+            if ! git rebase "$SYNCED_MAIN"; then
               git rebase --abort
               {
                 echo "### $branch: the rebase stopped"
                 echo
-                echo "upstream/main moved to \`$(git rev-parse --short upstream/main)\`, and $branch does not replay cleanly on it."
+                echo "main was synced to \`$SYNCED_MAIN\`, but $branch does not replay cleanly on it."
                 echo "$branch was not pushed: it still points at \`$old\`."
                 echo
                 echo "Finish it by hand:"
                 echo
                 echo '```'
-                echo "git fetch origin $branch"
+                echo "git fetch origin"
                 echo "git checkout $branch"
                 echo "git rebase origin/main                 # resolve, git add, git rebase --continue"
                 echo "git push --force-with-lease origin $branch"
@@ -88,6 +131,18 @@ jobs:
               echo "::error::$branch did not replay on upstream - resolve it by hand (see the run summary)"
               exit 1
             fi
-            git push --force-with-lease origin "$branch"
-            echo "== $branch: $(git rev-parse --short "$old") -> $(git rev-parse --short HEAD)"
+            after=$(git rev-parse HEAD)
+            git push --force-with-lease="refs/heads/$branch:$old" origin "HEAD:refs/heads/$branch"
+            remote=$(git ls-remote --heads origin "refs/heads/$branch" | cut -f1)
+            if [[ "$remote" != "$after" ]]; then
+              echo "::error::the remote patch branch changed after the push; inspect it before retrying"
+              exit 1
+            fi
+            {
+              echo "### $branch synced"
+              echo "Before: $old"
+              echo "After: $after"
+              echo "Base: $SYNCED_MAIN"
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "== $branch: $old -> $after"
           done
