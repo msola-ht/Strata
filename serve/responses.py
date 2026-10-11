@@ -58,7 +58,7 @@ def new_id(prefix: str) -> str:
 
 # ------------------------------------------------------------------------------------------------ request -> chat
 def _content(content, param):
-    """A message's (or a tool output's) content -> the template's form: a string, or text and image parts."""
+    """A message's (or a tool output's) content -> template text, image or video parts."""
     if content is None:
         return ""
     if isinstance(content, str):
@@ -82,8 +82,16 @@ def _content(content, param):
                 raise ResponsesError("only images given as image_url (a data: or http(s) URL) are supported; "
                                      "this server keeps no files", f"{param}[{j}]", "unsupported_parameter")
             parts.append({"type": "input_image", "image_url": part["image_url"]})
+        elif kind in ("input_video", "video_url"):
+            source = part.get("video_url")
+            if isinstance(source, dict) and set(source) == {"url"}:
+                source = source["url"]
+            if not isinstance(source, str) or not source or set(part) - {"type", "video_url"}:
+                raise ResponsesError("input_video requires video_url (a string or {url: string}); "
+                                     "sampling overrides and file IDs are not supported", f"{param}[{j}]")
+            parts.append({"type": "input_video", "video_url": source})
         else:
-            raise ResponsesError(f"content parts of type {kind!r} are not supported (text and images are)",
+            raise ResponsesError(f"content parts of type {kind!r} are not supported (text, images and videos are)",
                                  f"{param}[{j}].type", "unsupported_parameter")
     return _parts_of(parts)
 
@@ -135,6 +143,8 @@ def input_messages(req: dict) -> list[dict]:
     if instructions not in (None, ""):
         messages.append({"role": "system", "content": _content(instructions, "instructions")
                          if not isinstance(instructions, str) else instructions})
+        if isinstance(messages[-1]["content"], list) and any(p.get("type") == "video" for p in messages[-1]["content"]):
+            raise ResponsesError("video input is supported in user messages only", "instructions")
     items = req.get("input")
     if items is None:
         raise ResponsesError("input is required: a string or an array of input items", "input", "missing_required_parameter")
@@ -164,6 +174,8 @@ def input_messages(req: dict) -> list[dict]:
             if role not in ("user", "assistant", "system", "developer"):
                 raise ResponsesError(f"unknown message role {role!r}", param + ".role")
             content = _content(item.get("content"), param + ".content")
+            if role != "user" and isinstance(content, list) and any(p.get("type") == "video" for p in content):
+                raise ResponsesError("video input is supported in user messages only", param + ".content")
             if role == "assistant":
                 turn(content if isinstance(content, str) else "".join(
                     p.get("text", "") for p in content if p.get("type") == "text"))

@@ -56,9 +56,10 @@ sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
 from serve.frontend import (THINK_END, ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
                             forced_call, images_of, literal_tags, mark_think_literals, openai_to_messages,
-                            tool_choice_of, unmark_think_literals)
+                            tool_choice_of, unmark_think_literals, videos_of)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 from serve import runconfig  # noqa: E402
+from serve import video as video_api  # noqa: E402
 from serve import logit_bias as bias_api  # noqa: E402
 from serve.winjob import contain  # noqa: E402
 from serve.structured import StructuredOutputError, prepare_format, validated_json  # noqa: E402
@@ -2011,7 +2012,9 @@ class Vision:
             args += ["--max-tokens", str(cfg["max_tokens"])]
         if cfg.get("min_tokens"):                       # #767: mtmd's image_min_tokens (a hand-edited key)
             args += ["--min-tokens", str(cfg["min_tokens"])]
+        self.video_policy = video_api.policy(cfg.get("video"))
         self.dir = self.work_dir()
+        self.video_capable = False
         self.spawn = (args, log, env)                   # to start it again after an unload
         self.proc = None
         self.stopped = True
@@ -2043,6 +2046,83 @@ class Vision:
             raise RuntimeError(vision_start_error(line, self.spawn[1]))
         self.stopped = False
 
+        self.video_capable = "video=SVF2" in line.split()
+
+    def encode_video(self, packet, output, budget):
+        """No video cache: one request owns the packet and all output until handoff."""
+        with video_api.acquire(self.lock, budget):
+            if not self.video_capable or not self.alive():
+                raise video_api.VideoError("video requires a rebuilt strata-vision with SVF2 capability")
+            proc = self.proc
+            answers = queue.Queue()
+
+            def read():
+                try:
+                    for _ in range(2):
+                        line = proc.stdout.readline(1 << 20)
+                        answers.put(line)
+                        if not line.startswith("OK "):
+                            break
+                except (OSError, ValueError):
+                    answers.put("")
+
+            reader = threading.Thread(target=read, daemon=True)
+            clean_rejection = False
+            try:
+                packet_name = Path(packet).relative_to(self.dir).as_posix()
+                output_name = Path(output).relative_to(self.dir).as_posix()
+                proc.stdin.write(f"ENCV2 {budget.settings['max_tokens']} {packet_name} {output_name}\n")
+                proc.stdin.flush()
+                reader.start()
+                result = []
+                while len(result) < 2:
+                    budget.check()
+                    try:
+                        line = answers.get(timeout=0.1)
+                    except queue.Empty:
+                        continue
+                    if not result and line.startswith("ERR ") and line.endswith("\n"):
+                        clean_rejection = True             # one complete ERR ends this exchange; keep the encoder alive
+                        raise video_api.VideoError("video encoder: " + line[4:].strip())
+                    if not line.endswith("\n") or (not result and not line.startswith("OK ")):
+                        raise video_api.VideoError("video encoder rejected the frame packet")
+                    result.append(line.strip())
+                fields = result[0].split()
+                if len(fields) != 5 or not result[1].startswith("LAYOUT "):
+                    raise video_api.VideoError("invalid video encoder response")
+                count, pairs, frames = map(int, fields[1:4])
+                if not 0 < count <= budget.settings["max_tokens"]:
+                    raise video_api.VideoError("video encoder exceeded its token budget")
+                if not 0 < frames <= budget.settings["max_frames"] or pairs != (frames + 1) // 2:
+                    raise video_api.VideoError("video encoder returned invalid frame counts")
+                layout = []
+                parts = result[1][7:].split(";")
+                if len(parts) != pairs * 2:
+                    raise video_api.VideoError("video layout and pair count disagree")
+                for i in range(0, len(parts), 2):
+                    stamp, image = parts[i:i + 2]
+                    if not stamp.startswith("S") or not image.startswith("I"):
+                        raise video_api.VideoError("invalid video layout")
+                    seconds, cells = float(stamp[1:]), int(image[1:])
+                    if not math.isfinite(seconds) or not 0 <= seconds <= budget.settings["max_duration_s"] \
+                            or (layout and seconds <= layout[-1][0]) or not 0 < cells <= 1024:
+                        raise video_api.VideoError("invalid video timestamp or cell count")
+                    layout.append((seconds, cells))
+                if sum(cells for _, cells in layout) != count:
+                    raise video_api.VideoError("video layout and embeddings disagree")
+                budget.check()
+                return Path(output), count, layout
+            except BaseException:
+                if not clean_rejection:
+                    self.stopped = True
+                    proc.kill()
+                    proc.wait(timeout=5)
+                Path(output).unlink(missing_ok=True)
+                raise
+            finally:
+                if reader.ident is not None:
+                    reader.join(timeout=5)
+
     def _readline(self, timeout: float, what: str) -> str:
         """One line from the encoder, waiting at most `timeout` s (#1317).  On a timeout the encoder is killed, so the
         next request starts a fresh one, and the read raises RuntimeError instead of holding the request turn."""
@@ -2067,6 +2147,10 @@ class Vision:
 
     def alive(self) -> bool:
         return self.proc is not None and not self.stopped and self.proc.poll() is None
+
+    def video_available(self) -> bool:
+        return bool(self.video_policy and self.video_capable and self.alive()
+                    and all(shutil.which(self.video_policy[k]) for k in ("ffmpeg", "ffprobe")))
 
     def unload(self):
         """Stop the encoder process (its VRAM or RAM goes back); the encoded images stay cached on disk."""
@@ -2808,6 +2892,7 @@ class Service:
         self.fifo = threading.Lock()
         self.slot_save_path = None                    # --slot-save-path: /slots/0?action=save|restore (off when None)
         self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
+        self.video_slot = threading.Lock()            # one bounded video preparation directory at a time
         self.api_key = ""                              # when set, /v1/* needs it (Bearer or x-api-key)
         # #458 (opt-in, the config's "effort_position": "end"): a non-default reasoning effort goes in a short system
         # turn before the answer instead of the top of the prompt, so switching it keeps the cached conversation
@@ -3461,6 +3546,12 @@ class Service:
         """-> (ids, thinking, max_new). An unset or non-positive max_new (some clients send -1) means "unlimited":
         the rest of the context.  `force` (forced_call): without thinking the reply starts with it, so it ends the
         prompt; with thinking, Service.run writes it once the thinking is over."""
+        videos = videos_of(messages)
+        if videos:
+            budget = getattr(self.embeddings, "video_budget", None)
+            if budget is None:
+                raise ValueError("video input is supported through POST /v1/responses only")
+            return self._prepare_video(messages, tools, kwargs, max_new, force, req, budget)
         fetched = self._note_unreadable_tool_images(messages)
         ids = self.encode_prompt(messages, tools, kwargs)
         if force and kwargs.get("enable_thinking", True) is False:
@@ -3536,6 +3627,61 @@ class Service:
             write_temporary(combined, [p for p, _ in encoded])
         if req is not None and req.get("strata_prefix") is not None:
             req["strata_prefix"] = self.resolve_prefix(req["strata_prefix"], messages, tools, kwargs, ids, bool(images))
+        return ids, kwargs.get("enable_thinking", True) is not False, max_new
+
+    def _prepare_video(self, messages, tools, kwargs, max_new, force, req, budget):
+        videos = videos_of(messages)
+        if len(videos) != 1 or images_of(messages):
+            raise video_api.VideoError("send one video per request; mixed video/image requests are not supported yet")
+        if any(m.get("role") != "user" and videos_of([m]) for m in messages):
+            raise video_api.VideoError("video input is supported in user messages only")
+        if self.vision is None or self.vision.video_policy is None:
+            raise video_api.VideoError("video is disabled; enable vision.video.enabled and rebuild strata-vision")
+        if not self.vision.video_capable:
+            raise video_api.VideoError("strata-vision does not advertise the required SVF2 video profile")
+        budget.check()
+        ids = self.encode_prompt(messages, tools, kwargs)
+        marker = self.tok.encode("<|vision_start|><|video_pad|><|vision_end|>", parse_special=True)
+        pad = self.tok.encode(IMAGE_PAD, parse_special=True)
+        if len(marker) != 3 or len(pad) != 1:
+            raise video_api.VideoError("tokenizer has no supported video markers")
+        positions = [i for i in range(len(ids) - 2) if ids[i:i + 3] == marker]
+        if len(positions) != 1:
+            raise video_api.VideoError("the prompt and its video marker do not match")
+        ctx = self.engine.max_context or getattr(self.engine, "known_ctx", 0)
+        visual_room = ctx - CTX_SLACK - len(ids) - (max_new if max_new and max_new > 0 and not self.fit_max_tokens else 1)
+        if visual_room < 1:
+            raise video_api.VideoContextError("video request exceeds the context window before video preparation")
+        with contextlib.nullcontext():                  # the handler holds video_slot through generation
+            with tempfile.TemporaryDirectory(prefix="video-", dir=self.vision.dir) as directory:
+                packet = video_api.prepare(videos[0], directory, budget)
+                with video_api.acquire(self.fifo, budget):
+                    output, _, layout = self.vision.encode_video(packet, Path(directory) / "video.sve", budget)
+                    replacement = []
+                    for seconds, cells in layout:
+                        replacement += self.tok.encode(f"<{seconds:.17g} seconds>", parse_special=False)
+                        replacement += [marker[0]] + pad * cells + [marker[2]]
+                    at = positions[0]
+                    ids = ids[:at] + replacement + ids[at + 3:]
+                    if force and kwargs.get("enable_thinking", True) is False:
+                        ids += self.tok.encode(force, parse_special=True)
+                    ctx = self.engine.max_context or getattr(self.engine, "known_ctx", 0)
+                    room = ctx - CTX_SLACK - len(ids)
+                    if room < 1 or (max_new and max_new > room and not self.fit_max_tokens):
+                        raise video_api.VideoContextError("video request exceeds the context window; reduce video or output budget")
+                    max_new = room if max_new is None or max_new <= 0 else min(room, max_new)
+                    budget.check()
+                    combined = self.vision.dir / ("video-request-" + uuid.uuid4().hex + ".sve")
+                    self.embeddings.path = combined
+                    try:
+                        # Move within the same directory tree: no second full embedding copy or stale cache entry.
+                        os.replace(output, combined)
+                        if req is not None and req.get("strata_prefix") is not None:
+                            req["strata_prefix"] = self.resolve_prefix(req["strata_prefix"], messages, tools, kwargs, ids, True)
+                        budget.check()
+                    except BaseException:
+                        self.drop_embeddings()
+                        raise
         return ids, kwargs.get("enable_thinking", True) is not False, max_new
 
     PREFIX_END = "\u0001strata-prefix-end\u0001"          # marks where a message's shared part ends in the rendered prompt
@@ -4925,6 +5071,9 @@ def make_handler(svc: Service):
             elif path in ("/health", "/api/health"):
                 self._json(200, {"status": "ok", "max_context": svc.reported_ctx(), "model": svc.model,
                                  "images": svc.vision is not None, "api_key": bool(svc.api_key),
+                                 **({"videos": svc.loaded() and not getattr(svc.engine, "batch", 0)
+                                     and svc.vision.video_available()} if svc.vision is not None
+                                    and svc.vision.video_policy is not None else {}),
                                  "loaded": svc.loaded(), "service": "strata"})
             elif path == "/status":
                 if not self._authorized():                  # #212: it shows the end of the last answer
@@ -4945,7 +5094,10 @@ def make_handler(svc: Service):
                     loaded = svc.loaded()
                     model = {"id": svc.model, "object": "model", "status": {"value": "loaded"},
                              "meta": {"n_ctx": svc.reported_ctx()},
-                             "architecture": {"input_modalities": ["text", "image"] if svc.vision is not None else ["text"],
+                             "architecture": {"input_modalities": (["text", "image"] +
+                                               (["video"] if loaded and not getattr(svc.engine, "batch", 0)
+                                                and svc.vision.video_available() else []))
+                                               if svc.vision is not None else ["text"],
                                               "output_modalities": ["text"]}}
                     if not loaded and (svc.idle_unload_s or getattr(svc.engine, "unloaded", False)):
                         model["status"] = {"value": "unloaded"}   # like llama-server's router: listed, loads on use
@@ -5417,35 +5569,52 @@ def make_handler(svc: Service):
         def _responses(self, req):
             """#451: POST /v1/responses - OpenAI's Responses API, stateless (serve/responses.py), on the chat path.
             Errors use the Responses format; once the stream has started they arrive as a response.failed event."""
+            if not hasattr(self, "video_prepared"):
+                try:
+                    has_video = bool(videos_of(responses_api.input_messages(req)))
+                except ResponsesError as e:
+                    return self._json(e.status, e.body())
+                if has_video:
+                    return self._responses_video(req)
             try:
                 title = (responses_api.thread_title_events(req, svc.model_for(req))
-                         if svc.codex_thread_titles else None)
+                         if svc.codex_thread_titles and not hasattr(self, "video_prepared") else None)
             except ResponsesError as e:
                 return self._json(e.status, e.body())
             if title is not None:
                 return self._responses_ready(req, title)
             try:
-                ids, thinking, tools, max_new, asm, validator, req = self._responses_prepare(req)
+                ids, thinking, tools, max_new, asm, validator, req = (self.video_prepared
+                    if hasattr(self, "video_prepared") else self._responses_prepare(req))
             except ResponsesError as e:
                 return self._json(e.status, e.body())
             except ModelBusy as e:
                 return self._json(409, responses_error_body(str(e), "server_error", code="model_busy"))
             except (GpuBusy, EngineStarting, EngineStuck, EngineDied) as e:
                 return self._json(503, responses_error_body(str(e), "server_error", code="server_error"))
-            cancel = threading.Event()
-            self._watch_client(cancel)                       # #430 #431
+            cancel = getattr(self, "video_cancel", None) or threading.Event()
+            if not hasattr(self, "video_cancel"):
+                self._watch_client(cancel)                   # #430 #431
 
             def check(text, finish):
                 return validated_json(text, validator, finish)
 
             def events():
-                yield from asm.start()
+                if not getattr(self, "video_stream_started", False):
+                    yield from asm.start()
                 done = None
+                last_visible = time.monotonic()
                 for kind, x in svc.run(ids, thinking, tools, max_new, req, cancel):
                     if kind == "ping":
                         yield None
                     elif kind == "event":
-                        yield from asm.feed(x)
+                        visible = asm.feed(x)
+                        if visible:
+                            yield from visible
+                            last_visible = time.monotonic()
+                        elif time.monotonic() - last_visible >= 10:
+                            yield None                      # tool arguments held by the Responses assembler
+                            last_visible = time.monotonic()
                     elif kind == "done":
                         done = x
                 if done is not None and done["finish"] != "cancel" and not cancel.is_set():
@@ -5465,7 +5634,8 @@ def make_handler(svc: Service):
                 except ValueError as e:                      # the engine's ERR line
                     return self._json(500, responses_error_body(str(e), "server_error", code="server_error"))
                 return self._json(200, result)
-            self._sse()
+            if not getattr(self, "video_stream_started", False):
+                self._sse()
             last = time.monotonic()
 
             def send(e):
@@ -5496,6 +5666,134 @@ def make_handler(svc: Service):
                 self._responses_failed(asm, str(e), "structured_output_failed", send)
             except ValueError as e:                          # the engine's ERR after the stream started
                 self._responses_failed(asm, str(e), "server_error", send)
+
+        def _responses_video(self, req):
+            """Prepare off the socket thread; heartbeat timing follows actual writes.
+
+            A single slot covers preparation AND generation, bounding live video
+            artifacts. Worker thread-local embeddings are explicitly handed off.
+            """
+            try:
+                responses_api.check_request(req)
+                messages = responses_api.input_messages(req)
+                if len(videos_of(messages)) != 1 or images_of(messages):
+                    raise ResponsesError("send one video per request without image parts", "input")
+                if svc.vision is None or svc.vision.video_policy is None:
+                    raise ResponsesError("video is disabled; enable vision.video.enabled", "input", "video_unavailable")
+                if getattr(svc.engine, "batch", 0):
+                    raise ResponsesError("video input is not supported with engine batching", "input", "video_unavailable")
+                if not svc.loaded() or not svc.vision.alive():
+                    raise ResponsesError("load the model and vision encoder before sending video", "input",
+                                         "video_unavailable", status=503)
+                if not svc.vision.video_capable:
+                    raise ResponsesError("rebuild strata-vision with SVF2 video support", "input", "video_unavailable")
+                tools, names, _ = responses_api.request_tools(req)
+            except ResponsesError as e:
+                return self._json(e.status, e.body())
+            cancel = self.video_cancel = threading.Event()
+            self._watch_client(cancel)
+            budget = video_api.Budget(svc.vision.video_policy, cancel)
+            asm = responses_api.Assembler(req, svc.model_for(req), 0, names, False)
+
+            def send(e):
+                try:
+                    self.wfile.write(f"event: {e['type']}\n".encode() + b"data: " +
+                                     json.dumps(e, ensure_ascii=False).encode() + b"\n\n")
+                    self.wfile.flush()
+                except OSError as e:
+                    raise ConnectionError("video response client disconnected") from e
+
+            last = time.monotonic()
+            held, worker = False, None
+            with svc.status_lock:
+                svc.status["queued"] += 1
+            counted = True
+            box, ready = {}, threading.Event()
+            try:
+                if req.get("stream"):
+                    self._sse()
+                    self.video_stream_started = True
+                    for event in asm.start():
+                        send(event)
+
+                def beat():
+                    nonlocal last
+                    budget.check()
+                    if req.get("stream") and time.monotonic() - last >= 10:
+                        send(asm.in_progress())
+                        last = time.monotonic()
+
+                while not held:
+                    beat()
+                    held = svc.video_slot.acquire(timeout=0.1)
+
+                def prepare():
+                    svc.embeddings.video_budget = budget
+                    svc.request_trace.record = self.record
+                    try:
+                        box["result"] = self._responses_prepare(req)
+                        budget.check()
+                        box["path"] = getattr(svc.embeddings, "path", None)
+                        svc.embeddings.path = None
+                    except Exception as e:
+                        box["error"] = e
+                    finally:
+                        try:
+                            svc.drop_embeddings()
+                        except OSError as e:
+                            box["error"] = e
+                        finally:
+                            ready.set()
+
+                worker = threading.Thread(target=prepare, daemon=True, name="strata-video-prepare")
+                worker.start()
+                while not ready.wait(0.1):
+                    beat()
+                beat()
+                if "error" in box:
+                    raise box["error"]
+                result = list(box["result"])
+                prepared_asm = result[4]
+                if req.get("stream"):
+                    prepared_asm.response["id"] = asm.response["id"]
+                    prepared_asm.response["created_at"] = asm.response["created_at"]
+                    prepared_asm.seq = asm.seq
+                asm = prepared_asm
+                svc.embeddings.path = box.pop("path", None)
+                self.video_prepared = result
+                with svc.status_lock:
+                    svc.status["queued"] -= 1
+                counted = False
+                self._responses(req)
+            except ConnectionError:
+                cancel.set()
+                self._note(outcome="disconnected")
+            except Exception as e:
+                cancel.set()
+                message = str(e) if isinstance(e, (ValueError, EngineDied)) else "video preparation failed"
+                if getattr(self, "video_stream_started", False):
+                    code = e.code if isinstance(e, ResponsesError) and e.code else "video_preparation_failed"
+                    self._responses_failed(asm, message, code, send)
+                elif isinstance(e, ResponsesError):
+                    self._json(e.status, e.body())
+                else:
+                    self._json(400 if isinstance(e, ValueError) else 503,
+                               responses_error_body(message, code="video_preparation_failed"))
+            finally:
+                cancel.set()
+                try:
+                    if worker is not None and worker.ident is not None:
+                        worker.join()                      # budget polling stops codecs and native encoder first
+                    path = box.pop("path", None)
+                    if path is not None:
+                        Path(path).unlink(missing_ok=True)
+                    svc.drop_embeddings()
+                finally:
+                    if held:
+                        svc.video_slot.release()
+                    if counted:
+                        with svc.status_lock:
+                            svc.status["queued"] -= 1
 
         def _responses_failed(self, asm, message, code, send):
             e = asm.failed(message, code)
@@ -5538,15 +5836,23 @@ def make_handler(svc: Service):
                 check_request_sampling(req)                   # the request is also the sampling dict (see below)
             except ValueError as e:                           # its message starts with the field's name: the param
                 raise ResponsesError(str(e), str(e).partition(":")[0]) from None
-            svc.load()
+            video_budget = getattr(svc.embeddings, "video_budget", None)
+            if video_budget is not None:
+                video_budget.check()
+                if not svc.loaded() or svc._vision_down():
+                    raise EngineStarting("load the model and vision encoder before sending video")
+                svc.last_request_at = time.time()
+            else:
+                svc.load()
             # #924 (opt-in): a Codex compaction request is rendered with its conversation's tools, so its prompt
             # starts as the cached one did; the parser and the response keep the request's own tools
             shown = responses_api.prompt_tools(req, tools) if svc.codex_compaction_cache else tools
             try:
                 try:
                     ids, thinking, max_new = svc.prepare(messages, shown, kw, req.get("max_output_tokens") or 0, req=req)
-                except ValueError:
-                    if shown is tools:
+                except ValueError as e:
+                    if shown is tools or (isinstance(e, video_api.VideoError)
+                                          and not isinstance(e, video_api.VideoContextError)):
                         raise
                     shown = tools                            # too long with the kept tools: the request as sent
                     ids, thinking, max_new = svc.prepare(messages, shown, kw, req.get("max_output_tokens") or 0, req=req)

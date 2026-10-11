@@ -128,6 +128,7 @@ def _text_of(content) -> str:
 
 
 IMAGE_PARTS = ("image_url", "input_image", "image")
+VIDEO_PARTS = ("input_video", "video_url", "video")
 
 # Thinking levels.  The model's template knows low, medium and xhigh (its default; "high" means xhigh), and
 # enable_thinking=false for none.  Clients spell these many ways; everything maps onto those four.
@@ -158,7 +159,8 @@ def budget_effort(tokens) -> dict:
 
 
 def _has_image(content) -> bool:
-    return isinstance(content, list) and any(isinstance(p, dict) and p.get("type") in IMAGE_PARTS for p in content)
+    return isinstance(content, list) and any(isinstance(p, dict) and p.get("type") in IMAGE_PARTS + VIDEO_PARTS
+                                             for p in content)
 
 
 def _image_source(part: dict) -> str:
@@ -188,6 +190,15 @@ def _parts_of(content):
             continue
         if part.get("type") in IMAGE_PARTS:
             items.append({"type": "image", "source": _image_source(part)})
+        elif part.get("type") in VIDEO_PARTS:
+            source = part.get("video_url") or part.get("source")
+            if isinstance(source, dict):
+                source = source.get("url")
+            if not isinstance(source, str) or not source:
+                raise ValueError("a video requires a nonempty video_url string")
+            if set(part) - {"type", "video_url", "source"}:
+                raise ValueError("video sampling is configured by the server; per-part overrides are not supported")
+            items.append({"type": "video", "source": source})
         elif part.get("type") in TEXT_PARTS and "text" in part:
             items.append({"type": "text", "text": part.get("text", "")})
     return items
@@ -215,6 +226,8 @@ def _check_parts(content, path: str, kinds):
         if not isinstance(part, dict):
             continue
         kind = part.get("type")
+        if kind in VIDEO_PARTS:
+            raise ValueError("video input is supported through POST /v1/responses only")
         if kind == "refusal":
             if out is content:
                 out = list(content)
@@ -230,6 +243,11 @@ def images_of(messages: list[dict]) -> list[str]:
     <|vision_start|><|image_pad|><|vision_end|> per image item, message by message)."""
     return [item["source"] for m in messages if isinstance(m.get("content"), list)
             for item in m["content"] if item.get("type") == "image"]
+
+
+def videos_of(messages: list[dict]) -> list[str]:
+    return [item["source"] for m in messages if isinstance(m.get("content"), list)
+            for item in m["content"] if item.get("type") == "video"]
 
 
 # #537: a literal <think> / </think> inside a message's text is plain text, not the model's reasoning markers.  The
