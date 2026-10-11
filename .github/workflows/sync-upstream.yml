@@ -1,0 +1,93 @@
+# Keep this fork on top of upstream (Niko1221/Strata), whatever upstream does: every run takes upstream/main as
+# it is, brings it into main, and replays the patch branches on top of it. Nothing here decides whether an
+# upstream move is worth taking - a run with nothing new is a no-op, a run after an upstream push moves the
+# branches. A patch branch that stops on a conflict ends the run; that rebase is finished by hand, and the next
+# run starts from the branches as they are then.
+#
+# main is upstream's main plus this file, so the merge is a fast-forward until something else is added to main
+# here. The patch branches are rewritten (rebase), so they are pushed with --force-with-lease. Everything is
+# pushed with the workflow's own token, and a push with that token starts no workflow: this cannot loop.
+name: sync-upstream
+
+on:
+  schedule:
+    - cron: "23 * * * *"                  # hourly; GitHub starts scheduled runs late under load, that is fine
+  workflow_dispatch:                      # or by hand: Actions -> sync-upstream -> Run workflow
+    inputs:
+      branches:
+        description: "patch branches to replay on main, space separated"
+        required: false
+        default: ""
+
+permissions:
+  contents: write                         # pushing main and the rebased patch branches back to the fork
+
+concurrency:
+  group: sync-upstream                    # one sync at a time; a queued run waits, it does not cancel
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: https://github.com/Niko1221/Strata.git
+  PATCH_BRANCHES: codex-tool-search       # the branches carrying this fork's own commits
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: fetch upstream
+        run: |
+          git config user.name  "strata-sync"
+          git config user.email "strata-sync@users.noreply.github.com"
+          git remote add upstream "$UPSTREAM" 2>/dev/null || git remote set-url upstream "$UPSTREAM"
+          git fetch --prune upstream
+          echo "upstream/main = $(git rev-parse --short upstream/main)"
+
+      - name: bring main up to upstream
+        run: |
+          git checkout main
+          # A plain merge: a fast-forward while this fork's main holds nothing upstream does not, and a merge
+          # commit once it holds this file too. Upstream history that shares no commit with ours (the 2026-10-06
+          # cleanup, #1276) stops here on purpose: that one is a by-hand job.
+          if ! git merge --no-edit upstream/main; then
+            echo "::error::main cannot be merged with upstream/main - resolve it by hand (see #1276)"
+            exit 1
+          fi
+          git push origin main
+
+      - name: replay the patch branches on main
+        env:
+          BRANCHES: ${{ inputs.branches }}
+        run: |
+          set -u
+          for branch in ${BRANCHES:-$PATCH_BRANCHES}; do
+            echo "== $branch"
+            git checkout "$branch" || exit 1
+            old=$(git rev-parse HEAD)
+            if ! git rebase main; then
+              git rebase --abort
+              {
+                echo "### $branch: the rebase stopped"
+                echo
+                echo "upstream/main moved to \`$(git rev-parse --short upstream/main)\`, and $branch does not replay cleanly on it."
+                echo "$branch was not pushed: it still points at \`$old\`."
+                echo
+                echo "Finish it by hand:"
+                echo
+                echo '```'
+                echo "git fetch origin $branch"
+                echo "git checkout $branch"
+                echo "git rebase origin/main                 # resolve, git add, git rebase --continue"
+                echo "git push --force-with-lease origin $branch"
+                echo '```'
+              } >> "$GITHUB_STEP_SUMMARY"
+              echo "::error::$branch did not replay on upstream - resolve it by hand (see the run summary)"
+              exit 1
+            fi
+            git push --force-with-lease origin "$branch"
+            echo "== $branch: $(git rev-parse --short "$old") -> $(git rev-parse --short HEAD)"
+          done
