@@ -2003,6 +2003,10 @@ class Vision:
         return Path(tempfile.mkdtemp(prefix="strata-vision-"))
 
     def __init__(self, cfg: dict, log=None, env: dict | None = None, lazy: bool = False):
+        idle = cfg.get("idle_unload_s", 0)
+        if isinstance(idle, bool) or not isinstance(idle, (int, float)) or not math.isfinite(idle) or idle < 0:
+            raise ValueError("vision.idle_unload_s must be a finite non-negative number (0 disables it)")
+        self.idle_unload_s = float(idle)
         absolute = lambda p: os.path.abspath(p) if os.path.dirname(str(p)) else p   # the encoder runs in its own dir (#480)  # noqa: E731
         args = [absolute(cfg["exe"]), "--mmproj", absolute(cfg["mmproj"]), "--model", absolute(cfg["model"])]
         if cfg.get("gpu"):
@@ -2024,7 +2028,9 @@ class Vision:
         if not lazy:
             self._start()
 
-    def _start(self):
+    def _start(self, budget=None):
+        if budget is not None:
+            budget.check()
         args, log, env = self.spawn
         # cwd is the encoder's directory: the ENC lines name the files relative to it (#480: no space in the line)
         self.proc = popen("the image encoder", args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -2032,19 +2038,26 @@ class Vision:
                           cwd=self.dir)
         contain(self.proc)
         try:
-            line = self._readline(VISION_READY_S, "the vision encoder did not start")
-        except RuntimeError as e:                       # silent for VISION_READY_S: it was ended, and it is not left half-started
-            self.proc, self.stopped = None, True
-            raise RuntimeError(str(e)) from None
-        if not line.startswith("READY"):
-            proc, self.proc = self.proc, None
+            line = self._readline(VISION_READY_S, "the vision encoder did not start", budget)
+            if not line.startswith("READY"):
+                raise RuntimeError(vision_start_error(line, self.spawn[1]))
+        except BaseException:
+            # A timed-out/cancelled startup owns this process; reap it before
+            # another request may start an encoder or reuse the FIFO.
+            proc = self.proc
             self.stopped = True
             try:
                 proc.kill()
+            except OSError:
+                pass                                # it may already have exited; still reap and close its pipes
+            try:
                 proc.wait(timeout=5)
-            except (OSError, subprocess.TimeoutExpired):
-                pass
-            raise RuntimeError(vision_start_error(line, self.spawn[1]))
+            except subprocess.TimeoutExpired:
+                raise EngineStuck("the vision encoder is still stopping after startup cancellation") from None
+            self.proc = None
+            proc.stdin.close()
+            proc.stdout.close()
+            raise
         self.stopped = False
 
         self.video_capable = "video=SVF2" in line.split()
@@ -2126,7 +2139,7 @@ class Vision:
                 if reader.ident is not None:
                     reader.join(timeout=5)
 
-    def _readline(self, timeout: float, what: str) -> str:
+    def _readline(self, timeout: float, what: str, budget=None) -> str:
         """One line from the encoder, waiting at most `timeout` s (#1317).  On a timeout the encoder is killed, so the
         next request starts a fresh one, and the read raises RuntimeError instead of holding the request turn."""
         proc = self.proc
@@ -2140,19 +2153,35 @@ class Vision:
 
         threading.Thread(target=read, daemon=True).start()
         try:
-            return got.get(timeout=timeout)
+            if budget is None:
+                return got.get(timeout=timeout)
+            deadline = time.monotonic() + timeout
+            while True:
+                budget.check()
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise queue.Empty
+                try:
+                    line = got.get(timeout=min(0.1, remaining))
+                    budget.check()
+                    return line
+                except queue.Empty:
+                    continue
         except queue.Empty:
             try:
                 proc.kill()
             except OSError:
                 pass
+            if budget is not None:
+                raise video_api.VideoError(f"{what}: startup timed out after {timeout:.0f} s") from None
             raise RuntimeError(f"{what}: it said nothing for {timeout:.0f} s") from None
 
     def alive(self) -> bool:
-        return self.proc is not None and not self.stopped and self.proc.poll() is None
+        proc = self.proc
+        return proc is not None and not self.stopped and proc.poll() is None
 
     def video_available(self) -> bool:
-        return bool(self.video_policy and self.video_capable and self.alive()
+        return bool(self.video_policy and self.video_capable and (self.alive() or self.idle_unload_s)
                     and all(shutil.which(self.video_policy[k]) for k in ("ffmpeg", "ffprobe")))
 
     def unload(self):
@@ -2160,16 +2189,23 @@ class Vision:
         self.close()
         self.stopped = True
 
-    def restart(self):
+    def restart(self, budget=None):
         """Start the encoder again after an unload (or if it died); the cache of encoded images is kept."""
         if self.proc is not None:
+            self.stopped = True
             try:
                 self.proc.kill()
             except OSError:
                 pass
+            try:
+                self.proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                raise EngineStuck("the previous vision encoder is still stopping") from None
+            self.proc.stdin.close()
+            self.proc.stdout.close()
         self.proc = None
         self.stopped = True
-        self._start()
+        self._start(budget)
 
     @staticmethod
     def load(source: str) -> bytes:
@@ -2298,24 +2334,34 @@ class Vision:
             return self.cache[key]
 
     def close(self):
-        proc, self.proc = self.proc, None
+        proc = self.proc
+        self.stopped = True
         if proc is None:
-            self.stopped = True
             return
         try:
-            proc.stdin.write("QUIT\n")
-            proc.stdin.flush()
-            proc.wait(timeout=10)
-        except Exception:
             try:
-                proc.kill()
-            except OSError:
-                pass
-            try:
+                if proc.poll() is None:
+                    proc.stdin.write("QUIT\n")
+                    proc.stdin.flush()
+                    proc.wait(timeout=10)
+            except (OSError, ValueError, subprocess.TimeoutExpired):
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
                 proc.wait(timeout=10)
-            except (OSError, subprocess.TimeoutExpired):
-                pass
-        self.stopped = True
+        except subprocess.TimeoutExpired:
+            # Keep ownership: a later unload/restart must reap this process,
+            # never start a second encoder while its VRAM is still held.
+            raise EngineStuck("the vision encoder is still releasing GPU/RAM; retry after it exits") from None
+        finally:
+            if proc.poll() is not None:
+                self.proc = None
+                for pipe in (proc.stdin, proc.stdout):
+                    try:
+                        pipe.close()
+                    except (OSError, ValueError):
+                        pass
 
     def shutdown(self):
         """#914: close() for good: the server ends, so the encoder's directory (one ~10 MB .sve per image, on a tmpfs
@@ -2936,6 +2982,20 @@ class Service:
         self.last_request_at = None                      # when a request last started or finished
         self.started_at = time.time()
         self.status_lock = threading.Lock()
+        # Video preparation and generation share one lifecycle lease, even while
+        # the public queue counter hands off to _run. Guard both fields with status_lock.
+        self._video_requests = 0
+        self._unloading = False
+        self.vision_idle_unload_s = getattr(vision, "idle_unload_s", 0)
+        spawn_args = getattr(engine, "spawn", (None, []))[1]
+        if self.vision_idle_unload_s and (getattr(engine, "batch", 0)
+                or any(flag in spawn_args for flag in ("--batch", "--slots"))):
+            raise ValueError("vision.idle_unload_s does not support engine batching")
+        self._vision_requests = 0
+        self._image_prepare_lock = threading.Lock()
+        self._vision_last_used = time.monotonic()
+        self._idle_stop = threading.Event()
+        self._idle_thread = None
         self.mcp = None                                  # serve/mcp.py's McpHub when MCP servers are configured
         # sharing the GPU with other programs (all off by default): unload the engine after this many idle seconds,
         # only start it again when this much VRAM is free, and run this command first (e.g. to unload another
@@ -3087,10 +3147,20 @@ class Service:
         except Exception:
             return None
 
-    def ensure_loaded(self):
+    def ensure_loaded(self, *, vision=None):
         """Start the engine if it is not running (unloaded, or it died - issue #27), after the before_load hook and
         the free-VRAM check.  The caller holds self.fifo."""
-        if self.loaded() and not self._vision_down():
+        # A full cold start keeps the original vision-first VRAM sizing order.
+        # Only a resident text engine may leave its idle encoder asleep.
+        want_vision = (not self.vision_idle_unload_s or not self.loaded()) if vision is None else vision
+        if self.loaded() and (not want_vision or not self._vision_down()):
+            if vision is True:
+                self._vision_last_used = time.monotonic()
+            return
+        if self.vision_idle_unload_s and self.loaded() and want_vision:
+            # The resident engine already owns its VRAM. The full-model hook
+            # and free-VRAM threshold would incorrectly gate an encoder-only wake.
+            self.ensure_vision_loaded()
             return
         if self.before_load:
             cmd = self.before_load
@@ -3109,13 +3179,14 @@ class Service:
                 raise GpuBusy(f"the GPU is in use by another program: {free} MiB of VRAM free, the model needs "
                               f"{self.min_free_vram_mib} (min_free_vram_mib) - it stays unloaded until that is free")
         vision_started = False
-        if self._vision_down():                         # first, as at a start: a GPU encoder takes its VRAM before
+        if want_vision and self._vision_down():          # first, as at a start: a GPU encoder takes its VRAM before
             print("[strata] starting the vision encoder ...", flush=True)   # the engine sizes its cache
             try:
                 self.vision.restart()
             except Exception as e:
                 raise EngineDied(f"the vision encoder failed to start: {e}") from e
             vision_started = True
+            self._vision_last_used = time.monotonic()
         if self.loaded():
             return
         if getattr(self.engine, "unloaded", False):
@@ -3176,11 +3247,15 @@ class Service:
         print(f"[strata] {e}. {note} The next request starts the engine again."
               f"{' Its log: ' + log if log else ''}", flush=True)
 
-    def load(self):
+    def load(self, *, vision=None):
         """POST /load and every generation request: start the engine now if it is unloaded (raises GpuBusy)."""
         # a request is on its way: the idle thread must not unload between this and the request's own start
         self.last_request_at = time.time()
-        if self.loaded() and not self._vision_down():
+        want_vision = (not self.vision_idle_unload_s or not self.loaded()) if vision is None else vision
+        if (self.loaded() and (not want_vision or not self._vision_down())
+                and not (self.vision_idle_unload_s and vision is True)):
+            if vision is True:
+                self._vision_last_used = time.monotonic()
             return
         trace = getattr(self.request_trace, "record", None)
         waiting = time.perf_counter()
@@ -3198,7 +3273,7 @@ class Service:
                         trace["queue_s"] += round(loading - waiting, 3)
                         trace["state"] = "loading"
                 try:
-                    self.ensure_loaded()
+                    self.ensure_loaded(vision=vision)
                 finally:
                     if trace is not None:
                         with self.status_lock:
@@ -3217,13 +3292,17 @@ class Service:
         if not self.fifo.acquire(blocking=False):
             return "busy"
         try:
-            if not self.engine.alive():
-                return "not loaded"
             with self.status_lock:
-                if self.status.get("busy") or self.status.get("queued"):
+                if self.status.get("busy") or self.status.get("queued") or self._video_requests or self._vision_requests:
                     return "busy"
-            if idle_for is not None and time.time() - (self.last_request_at or self.started_at) < idle_for:
-                return "busy"
+                if idle_for is not None and time.time() - (self.last_request_at or self.started_at) < idle_for:
+                    return "busy"
+                # Publish the decision before releasing status_lock: a video
+                # request must not accept live processes already being closed.
+                self._unloading = True
+            if not self.engine.alive() and (self.vision is None or
+                    (not self.vision.alive() and getattr(self.vision, "proc", None) is None)):
+                return "not loaded"
             self.engine.unload()
             if self.vision is not None and hasattr(self.vision, "unload"):
                 self.vision.unload()
@@ -3231,21 +3310,91 @@ class Service:
                   "the next request loads it again", flush=True)
             return "unloaded"
         finally:
+            with self.status_lock:
+                self._unloading = False
+            self.fifo.release()
+
+    def ensure_vision_loaded(self, budget=None):
+        """Caller holds fifo and a visual activity lease; never restarts the text engine."""
+        if not self._vision_down():
+            return
+        started = time.monotonic()
+        try:
+            self.vision.restart(budget=budget)
+        except video_api.VideoError:
+            raise
+        except Exception as e:
+            raise EngineDied(f"the vision encoder failed to start: {e}") from e
+        finally:
+            self._vision_last_used = time.monotonic()
+            print(f"[strata] vision stage=load elapsed_s={time.monotonic() - started:.3f} "
+                  f"ready={self.vision.alive()}", flush=True)
+
+    @contextlib.contextmanager
+    def image_activity(self):
+        # Register before waiting on fifo; unload uses the same status lock.
+        with self.status_lock:
+            self._vision_requests += 1
+        try:
+            # The image LRU has no per-entry pins. Serialize preparations until
+            # cached files have been copied to a request-owned embedding file.
+            with self._image_prepare_lock:
+                with self.fifo:
+                    self.ensure_loaded(vision=True)
+                yield
+        finally:
+            with self.status_lock:
+                self._vision_requests -= 1
+                self._vision_last_used = time.monotonic()
+
+    def unload_idle_vision(self):
+        """Keep the text engine and on-disk embeddings; close only an idle encoder."""
+        if not self.vision_idle_unload_s or not self.fifo.acquire(blocking=False):
+            return "busy"
+        try:
+            with self.status_lock:
+                if (self._vision_requests or self._video_requests or self.status.get("busy")
+                        or time.monotonic() - self._vision_last_used < self.vision_idle_unload_s):
+                    return "busy"
+                # Close outside status_lock. New visual requests register, then
+                # wait on fifo and reload; no request uses the process directly.
+            if not self.vision.alive() and getattr(self.vision, "proc", None) is None:
+                return "not loaded"
+            started = time.monotonic()
+            self.vision.unload()
+            print(f"[strata] vision stage=idle_unload elapsed_s={time.monotonic() - started:.3f}", flush=True)
+            return "unloaded"
+        finally:
             self.fifo.release()
 
     def start_idle_unload(self):
-        if not self.idle_unload_s or not hasattr(self.engine, "unload"):
+        whole = self.idle_unload_s if hasattr(self.engine, "unload") else 0
+        intervals = [s for s in (whole, self.vision_idle_unload_s) if s > 0]
+        if not intervals:
             return
-        print(f"[strata] the model unloads after {self.idle_unload_s} s without requests", flush=True)
+        if whole:
+            print(f"[strata] the model unloads after {whole} s without requests", flush=True)
+        if self.vision_idle_unload_s:
+            print(f"[strata] vision unloads independently after {self.vision_idle_unload_s} s without visual work",
+                  flush=True)
 
         def loop():
-            while True:
-                time.sleep(max(1.0, min(30.0, self.idle_unload_s / 4)))
+            floor = 0.1 if self.vision_idle_unload_s else 1.0
+            while not self._idle_stop.wait(max(floor, min(30.0, min(intervals) / 4))):
                 try:
-                    self.unload(idle_for=self.idle_unload_s)
+                    if whole:
+                        self.unload(idle_for=whole)
+                    if self.vision_idle_unload_s:
+                        self.unload_idle_vision()
                 except EngineStuck as e:                # tried again at the next turn; the thread keeps running
                     print(f"[strata] idle unload: {e}", flush=True)
-        threading.Thread(target=loop, daemon=True).start()
+        self._idle_thread = threading.Thread(target=loop, daemon=True, name="strata-idle-unload")
+        self._idle_thread.start()
+
+    def stop_idle_unload(self):
+        self._idle_stop.set()
+        if self._idle_thread is not None and self._idle_thread.ident is not None:
+            self._idle_thread.join()
 
     def set_shared(self, defaults) -> dict:
         """The Chat settings every client gets for what it leaves out; {} / None = clients use their own again."""
@@ -3474,7 +3623,9 @@ class Service:
             "concurrency": {"serving": max(1, int(getattr(self.engine, "batch", 0) or 0)),
                             "requested": max(1, int(getattr(self.engine, "batch", 0) or 0))},
             "dialects": ["/v1/chat/completions", "/v1/messages", "/v1/responses"],
-            "vision": {"enabled": images, "available": images, "error": None},
+            "vision": {"enabled": images, "available": images, "error": None,
+                       **({"loaded": not self._vision_down(), "idle_unload_s": self.vision_idle_unload_s}
+                          if self.vision_idle_unload_s else {})},
             "activity": {"requests": totals["requests"] + int(busy), "in_flight": int(busy) + int(s.get("queued") or 0),
                          "last_request_at": int(last_at) if last_at else None},
             "last_timings": last_t,
@@ -3548,6 +3699,11 @@ class Service:
         return fetched
 
     def prepare(self, messages, tools, kwargs, max_new=None, force=None, req=None):
+        activity = self.image_activity() if self.vision_idle_unload_s and images_of(messages) else contextlib.nullcontext()
+        with activity:
+            return self._prepare(messages, tools, kwargs, max_new, force, req)
+
+    def _prepare(self, messages, tools, kwargs, max_new=None, force=None, req=None):
         """-> (ids, thinking, max_new). An unset or non-positive max_new (some clients send -1) means "unlimited":
         the rest of the context.  `force` (forced_call): without thinking the reply starts with it, so it ends the
         prompt; with thinking, Service.run writes it once the thinking is over."""
@@ -3998,7 +4154,7 @@ class Service:
                     try:
                         if not par:
                             self.ensure_loaded()
-                        elif not (self.loaded() and not self._vision_down()):
+                        elif not (self.loaded() and (self.vision_idle_unload_s or not self._vision_down())):
                             with self.fifo:
                                 self.ensure_loaded()
                     except BaseException:
@@ -5318,9 +5474,9 @@ def make_handler(svc: Service):
                 return
             if path == "/load":                              # load now, e.g. ahead of a request
                 try:
-                    svc.load()
+                    svc.load(vision=True)
                     self._json(200, {"status": "loaded"})
-                except GpuBusy as e:
+                except (GpuBusy, EngineDied, EngineStuck) as e:
                     self._json(503, {"error": {"type": "server_error", "message": str(e)}})
                 return
             try:
@@ -5348,7 +5504,7 @@ def make_handler(svc: Service):
                             with svc.status_lock:
                                 if svc.status.get("busy") or svc.status.get("queued"):
                                     raise ModelBusy("a request is running or queued")
-                            svc.ensure_loaded()
+                            svc.ensure_loaded(vision=True)
                             svc.last_request_at = time.time()
                         finally:
                             svc.fifo.release()
@@ -5845,10 +6001,10 @@ def make_handler(svc: Service):
                     raise ResponsesError("video is disabled; enable vision.video.enabled", "input", "video_unavailable")
                 if getattr(svc.engine, "batch", 0):
                     raise ResponsesError("video input is not supported with engine batching", "input", "video_unavailable")
-                if not svc.loaded() or not svc.vision.alive():
+                if not svc.loaded() or (not svc.vision_idle_unload_s and not svc.vision.alive()):
                     raise ResponsesError("load the model and vision encoder before sending video", "input",
                                          "video_unavailable", status=503)
-                if not svc.vision.video_capable:
+                if not svc.vision.video_capable and (not svc.vision_idle_unload_s or svc.vision.alive()):
                     raise ResponsesError("rebuild strata-vision with SVF2 video support", "input", "video_unavailable")
                 tools, names, _ = responses_api.request_tools(req)
             except video_store.StoreError as e:
@@ -5870,11 +6026,16 @@ def make_handler(svc: Service):
 
             last = time.monotonic()
             held, worker = False, None
-            with svc.status_lock:
-                svc.status["queued"] += 1
-            counted = True
+            counted = admitted = False
             box, ready = {}, threading.Event()
             try:
+                with svc.status_lock:
+                    if svc._unloading or not svc.loaded() or (not svc.vision_idle_unload_s and not svc.vision.alive()):
+                        raise ResponsesError("load the model and vision encoder before sending video", "input",
+                                             "video_unavailable", status=503)
+                    svc._video_requests += 1
+                    svc.status["queued"] += 1
+                    counted = admitted = True
                 if req.get("stream"):
                     self._sse()
                     self.video_stream_started = True
@@ -5950,7 +6111,10 @@ def make_handler(svc: Service):
                 cancel.set()
                 self._note(outcome="disconnected")
             except Exception as e:
-                if file_id is not None and isinstance(e, video_api.VideoError):
+                if getattr(self, "video_stage", None) == "load" and isinstance(e, video_api.VideoError):
+                    code = "video_load_cancelled" if cancel.is_set() else "video_load_timeout"
+                    e = ResponsesError(str(e), "input", code, status=499 if cancel.is_set() else 408)
+                elif file_id is not None and isinstance(e, video_api.VideoError):
                     code = "video_queue_timeout" if time.monotonic() >= budget.deadline else \
                         "video_preparation_cancelled" if cancel.is_set() else "video_preparation_failed"
                     e = video_store.StoreError(code, str(e), 408 if code.endswith("timeout") else 400)
@@ -5978,9 +6142,13 @@ def make_handler(svc: Service):
                 finally:
                     if held:
                         svc.video_slot.release()
-                    if counted:
-                        with svc.status_lock:
+                    with svc.status_lock:
+                        if counted:
                             svc.status["queued"] -= 1
+                        if admitted:
+                            svc._video_requests -= 1
+                            svc.last_request_at = time.time()
+                            svc._vision_last_used = time.monotonic()
 
         def _responses_failed(self, asm, message, code, send):
             e = asm.failed(message, code)
@@ -6026,7 +6194,19 @@ def make_handler(svc: Service):
             video_budget = getattr(svc.embeddings, "video_budget", None)
             if video_budget is not None:
                 video_budget.check()
-                if not svc.loaded() or svc._vision_down():
+                if not svc.loaded():
+                    raise EngineStarting("load the model and vision encoder before sending video")
+                if svc.vision_idle_unload_s:
+                    self.video_stage = "load"
+                    try:
+                        with video_api.acquire(svc.fifo, video_budget):
+                            svc.ensure_vision_loaded(video_budget)
+                    except video_api.VideoError:
+                        raise
+                    except Exception as e:
+                        raise ResponsesError(str(e), "input", "video_load_failed", status=503) from e
+                    self.video_stage = "prepare"
+                elif svc._vision_down():
                     raise EngineStarting("load the model and vision encoder before sending video")
                 svc.last_request_at = time.time()
             else:
@@ -6131,7 +6311,16 @@ class Server(ThreadingHTTPServer):
         if not isinstance(sys.exc_info()[1], ConnectionError):   # a client that hangs up needs no stack trace
             super().handle_error(request, client_address)
 
+    def shutdown(self):
+        svc = getattr(self, "svc", None)
+        if svc is not None:
+            svc.stop_idle_unload()
+        super().shutdown()
+
     def server_close(self):
+        svc = getattr(self, "svc", None)
+        if svc is not None:
+            svc.stop_idle_unload()
         # the hardware sampler serve() started for this server stops with it (test isolation: every Service a test
         # started used to leave its sampler running, 21 of them after test_responses, which slowed test_parallel's timing)
         tel = getattr(getattr(self, "svc", None), "telemetry", None)
@@ -6726,6 +6915,10 @@ def main() -> int:
             print(f"[strata] sampling defaults from the config: {pretty}", flush=True)
         lazy = a.lazy or cfg.get("lazy_load") is True
         if cfg.get("vision"):
+            if cfg["vision"].get("idle_unload_s"):
+                args = cfg.get("args", [])
+                if any(flag in args for flag in ("--batch", "--slots")) or parallel_args(cfg, args):
+                    ap.error("vision.idle_unload_s does not support engine batching")
             print("loading the vision encoder ..." if not lazy else
                   "vision encoder unloaded; it starts with the model ...", flush=True)
             # relative paths are the config's cwd's, as for the engine below

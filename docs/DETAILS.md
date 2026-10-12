@@ -573,6 +573,45 @@ the OS file cache, so loading again takes seconds while that RAM is not needed e
 16 GB with Q2_0 in the low-RAM mode: unloading takes ~0.3 s, and a request to an unloaded model answered after
 4.6 s (text) or 14.7 s (a picture, image encoder on the CPU).
 
+**Release only the idle vision encoder (optional).** Add `"idle_unload_s": 600`
+inside the existing `"vision"` configuration object. The default is `0` (disabled);
+the value must be a finite, non-negative number of seconds. This setting is read
+at server startup and is separate from the top-level `idle_unload_s`. It is not
+supported with engine batching; startup rejects that combination.
+
+While the text engine stays resident, text requests do not wake the sleeping
+encoder or refresh its visual activity timer. Image requests, including tool
+images, wake it before preprocessing. Video Responses requests wake it within
+the video's existing deadline and cancellation budget. The timer waits for a
+safe engine turn and for visual work to finish; it never interrupts generation.
+Images remain protected until their cached embeddings have been copied into a
+request-owned file. Videos remain protected through generation and cleanup.
+File uploads and lookups do not count as visual activity.
+
+`POST /load` and `POST /v1/load` explicitly load both processes. A full cold start
+also retains the original vision-first order, even when triggered by text: the
+text engine sizes its cache after the encoder has taken its VRAM. Video requests
+still require the text engine to be loaded; independent vision wake does not
+introduce automatic full-model cold starts on that endpoint. Encoder-only wake
+does not run `before_load` or apply the full-model `min_free_vram_mib` threshold.
+It uses the VRAM released by the encoder; if another program or an explicit
+elastic-cache expansion has consumed it, startup can fail. Strata does not resize
+or restart the resident text engine to make room automatically.
+
+With this option enabled, `/v1/status` adds `vision.loaded` and
+`vision.idle_unload_s`. Logs report `vision stage=load elapsed_s=... ready=...`
+and confirmed `vision stage=idle_unload elapsed_s=...`. A process that fails to
+exit remains owned and blocks replacement; it is not reported as successfully
+unloaded. The idle worker stops when its HTTP server closes.
+
+Unloading preserves the vision work directory, image embeddings and uploaded
+video references. A restarted encoder has a new video-cache identity, so a valid
+file ID can be reused but its visual preprocessing is performed again. See
+[VIDEO_FILES.md](VIDEO_FILES.md) for errors, cancellation and observed limits.
+This is Python server behavior; no native engine rebuild is needed. Apply the
+configuration through the normal server restart procedure. Roll back by setting
+the nested value to `0` or removing it; no file migration or cleanup is required.
+
 **Giving part of the VRAM back while it keeps serving (#533, opt-in, one NVIDIA GPU; every request and answer:
 [VRAM_ELASTIC.md](VRAM_ELASTIC.md)).** With `"vram_elastic": true`
 in the config (the engine flag `--vram-elastic`), the expert cache is allocated in 512 MiB segments

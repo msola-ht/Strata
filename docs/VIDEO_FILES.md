@@ -20,11 +20,45 @@ this top-level setting to the server configuration, alongside an API key:
 ```
 
 `vision.video.enabled` must also be true. Startup refuses file support without
-an API key or enabled video policy. The model and SVF2 vision encoder must be
-loaded before analysis. File upload itself does not load the model. Disabling or
+an API key or enabled video policy. The text model must be loaded before analysis.
+The SVF2 vision encoder must also be loaded unless independent vision idle
+unloading is enabled as described below. File upload itself does not load the model. Disabling or
 omitting `video_files.enabled` leaves URL video preparation uncached. The existing
 single-video, user-message-only, no-image-mixing and no-engine-batching restrictions
 still apply. No generation or reasoning budget is added by this feature.
+
+With `idle_unload_s` enabled, an accepted video request prevents unloading from
+preparation through generation and request-file cleanup, including the queue
+handoff between those stages. The idle interval starts again after cleanup,
+including failed or cancelled requests. A request that loses admission to an
+unload receives 503 `video_unavailable` before its stream starts. Video requests
+do not automatically reload the text model; use the existing `/v1/load` control first.
+Uploads and file lookups do not keep the model resident. Idle unloading also
+reclaims a surviving vision encoder when the text engine has already exited.
+
+Model unloading does not remove uploaded files or extend their TTL. Restarting
+the encoder changes its cache identity, so a still-valid file reference can be
+reused but requires preprocessing again. Existing cache entries remain subject
+to the usual TTL and capacity eviction.
+
+To release only the encoder after visual inactivity, add `"idle_unload_s": 600`
+inside the existing `vision` object (default `0`, disabled). This does not change
+the top-level model idle timer. With the text engine resident, plain text
+requests leave vision asleep. The next image or video request loads it again;
+an explicit `/v1/load` also preloads it. Engine batching is not supported with
+this option. Full model cold starts retain vision-first loading for VRAM sizing;
+this video endpoint still requires a loaded text model. Details and rollback:
+[independent vision idle unloading](DETAILS.md#sharing-the-gpu-with-other-programs-optional).
+
+For video, FIFO waiting and encoder READY waiting use the same video request
+deadline and cancellation event as preprocessing. Encoder startup is also bounded
+by its existing READY timeout. Streaming requests keep their existing heartbeats.
+A cancelled startup kills and reaps the process it started before releasing the
+FIFO; process cleanup can take an additional five seconds. Other queued requests
+retain their own budgets and can start a fresh encoder. If a process cannot be
+reaped, its handle remains owned and replacement is refused. Successful startup
+refreshes encoder identity before a cache key is selected. No request context or
+answer is stored by the wake path.
 
 The store creates a private `strata-video-*` directory under the OS temporary
 directory, or under the existing parent supplied in `video_files.directory`.
@@ -236,6 +270,9 @@ body. After SSE starts they use `response.failed` with the same error code.
 | `video_preparation_failed` | 400, 502 or 503 | Preparation failure; valid ID can be retried |
 | `context_length_exceeded` | 400 | Reduce text history/output demand or change context capacity |
 | `video_unavailable` | 400 or 503 | Load a compatible video-capable model/encoder |
+| `video_load_failed` | 503 | Independent encoder startup failed; the video file need not be uploaded again |
+| `video_load_timeout` | 408 | Waiting for the encoder turn or READY exceeded its budget |
+| `video_load_cancelled` | 499 if still connected | This request cancelled while waiting for or starting the encoder |
 | `video_generation_timeout`, `video_generation_failed` | 503 or 500 | Model generation failed; the file can remain usable |
 
 Authentication failures remain 401. Different owners receive not-found even if
@@ -297,3 +334,53 @@ The pre-commit review also exercised overlapping accepted encodings for two
 different configured keys. The ambiguous header returned 401, the other owner's
 unambiguous header received 404 for the uploaded ID, and its original owner
 still received 200. The temporary server removed its store on close.
+
+For the idle-lifecycle follow-up, a temporary loopback server using the existing
+mock text engine returned HTTP 200, `completed`, and its scripted text through
+`/v1/responses`. With no vision configured, a request containing a local-file
+video URL returned 400 `video_unavailable` at the disabled-video guard, before
+video preparation. Afterwards, queued and active-video counts were zero and
+the unloading flag was false. This does not exercise URL validation or the new
+concurrent admission boundary. The temporary server was closed. Native idle
+unloading, orphan-encoder reclamation, cancellation during preparation and the
+preparation-to-generation handoff remain unobserved on a real model.
+
+For independent vision sleep, manual loopback HTTP observations used the existing
+mock text engine and a lazy `Vision` instance with a real `strata-vision` binary.
+No usable vision weights were supplied: missing model paths deliberately exercised
+startup failure rather than visual inference. Responses and Chat text requests
+returned 200 with the scripted text, and Messages returned 200 with scripted
+content; the encoder process remained absent. `/v1/status` reported
+`vision.loaded: false` and the configured 0.4-second idle interval.
+
+A video request attempted native encoder startup and returned 503
+`video_load_failed` for the missing model. Afterwards its process handle was
+empty, its activity/queue counts were zero and the FIFO was unlocked. Holding the
+FIFO during a video request with a 0.5-second deadline returned 408
+`video_load_timeout` after 0.505 seconds. A streaming request received
+`response.created`; disconnecting while it waited for the FIFO left zero video
+and queue counts at the 0.6-second observation, without starting an encoder.
+
+Image wake and explicit `/v1/load` both attempted native startup and returned
+503 for the missing model. With a configured two-second `before_load` sleep,
+these encoder-only failures returned in 0.010 and 0.007 seconds respectively:
+the full-model hook was bypassed. The image activity and preparation locks were
+released, and a subsequent text Responses request returned 200 `completed`.
+A NaN idle interval was rejected at configuration parsing. Temporary HTTP
+servers and vision work directories were closed and removed.
+
+Successful native vision reload, actual RAM/VRAM release, image/video inference
+after wake, cache invalidation after a successful wake, READY-wait cancellation
+and a process that resists termination remain unobserved. Queue cancellation and
+failed native startup observations do not establish those behaviors. No new or
+modified test assets were used.
+
+The final chain review reproduced a missing error boundary on `POST /load`:
+native encoder startup failure closed the connection without an HTTP response.
+After the fix, the same request returned structured 503 `server_error`, left no
+encoder process or queued request, and released the FIFO. A subsequent text
+Responses request returned 200 `completed` with the encoder still asleep.
+Explicit `/load` also now confirms readiness under the FIFO when independent
+vision sleep is enabled, preventing its fast return from racing an already
+decided idle unload. That successful-load race remains a source-reviewed path,
+not a reproduced native timing observation.
