@@ -2007,6 +2007,11 @@ class Vision:
         if isinstance(idle, bool) or not isinstance(idle, (int, float)) or not math.isfinite(idle) or idle < 0:
             raise ValueError("vision.idle_unload_s must be a finite non-negative number (0 disables it)")
         self.idle_unload_s = float(idle)
+        self.resource_gpu_index = None
+        device = cfg.get("cuda_device")
+        if cfg.get("gpu") and device is not None and str(device).isascii() and str(device).isdecimal():
+            if len(str(device)) <= 10 and int(device) < 2**31:
+                self.resource_gpu_index = int(device)
         absolute = lambda p: os.path.abspath(p) if os.path.dirname(str(p)) else p   # the encoder runs in its own dir (#480)  # noqa: E731
         args = [absolute(cfg["exe"]), "--mmproj", absolute(cfg["mmproj"]), "--model", absolute(cfg["model"])]
         if cfg.get("gpu"):
@@ -2996,6 +3001,7 @@ class Service:
         self._vision_last_used = time.monotonic()
         self._idle_stop = threading.Event()
         self._idle_thread = None
+        self._vision_last_unload = None
         self.mcp = None                                  # serve/mcp.py's McpHub when MCP servers are configured
         # sharing the GPU with other programs (all off by default): unload the engine after this many idle seconds,
         # only start it again when this much VRAM is free, and run this command first (e.g. to unload another
@@ -3360,12 +3366,42 @@ class Service:
                 # wait on fifo and reload; no request uses the process directly.
             if not self.vision.alive() and getattr(self.vision, "proc", None) is None:
                 return "not loaded"
+            before = self._vision_resource_snapshot(getattr(self.vision, "proc", None))
             started = time.monotonic()
             self.vision.unload()
-            print(f"[strata] vision stage=idle_unload elapsed_s={time.monotonic() - started:.3f}", flush=True)
+            elapsed = time.monotonic() - started
+            after = self._vision_resource_snapshot()
+            report = {"at": time.time(), "elapsed_s": round(elapsed, 3), "process_exited": True,
+                      "scope": "whole_devices_and_system",
+                      "before": before, "after": after}
+            with self.status_lock:
+                self._vision_last_unload = report
+            def value(n):
+                return "unavailable" if n is None else f"{n:.1f}"
+            def change(a, b):
+                delta = None if a is None or b is None else a - b
+                return f"{value(a)}->{value(b)} decrease={value(delta)} MiB"
+            gpu_after = {g["index"]: g["used_mib"] for g in after["gpus"]}
+            gpu_changes = " ".join(f"gpu[{g['index']}]={change(g['used_mib'], gpu_after.get(g['index']))}"
+                                   for g in before["gpus"]) or "gpu=unavailable"
+            print(f"[strata] vision stage=idle_unload elapsed_s={elapsed:.3f} "
+                  f"process_exited=True process_rss_before_mib={value(before['process_rss_mib'])} "
+                  f"process_private_before_mib={value(before['process_private_mib'])} "
+                  f"{gpu_changes} system_ram={change(before['system_ram_used_mib'], after['system_ram_used_mib'])} "
+                  "scope=whole_devices_and_system", flush=True)
             return "unloaded"
         finally:
             self.fifo.release()
+
+    def _vision_resource_snapshot(self, process=None):
+        try:
+            telemetry = getattr(self, "telemetry", None)
+            if telemetry is not None:
+                return telemetry.resource_snapshot(process)
+        except Exception:  # noqa: BLE001 - optional diagnostics must never block resource release
+            pass
+        return {"at": time.time(), "gpus": [], "system_ram_used_mib": None,
+                "process_rss_mib": None, "process_private_mib": None}
 
     def start_idle_unload(self):
         whole = self.idle_unload_s if hasattr(self.engine, "unload") else 0
@@ -3439,6 +3475,8 @@ class Service:
                                                     "prefill_tok_s_mean": self._prefill_tok_s_mean()},
                                        gpu_index=int(getattr(self, "gpu_index", 0) or 0),
                                        gpu_indices=getattr(self, "gpu_indices", None),
+                                       resource_gpu_index=(getattr(self.vision, "resource_gpu_index", None)
+                                                           if self.vision_idle_unload_s else None),
                                        amd=getattr(self, "backend", None) == "hip")
             if getattr(self, "engine", None) is not None and hasattr(self.engine, "gpu_busy"):
                 # #1317: the quick frozen-engine check does not end an engine whose GPU is busy (a long prompt chunk on a
@@ -3601,6 +3639,7 @@ class Service:
         the APIs, what is running, and the last request's timings in llama.cpp's names.  /metrics has the rest."""
         with self.status_lock:
             s, totals = dict(self.status), dict(self.totals)
+            vision_last_unload = self._vision_last_unload
             last_t, last_at = (dict(self.last_timings) if self.last_timings else None), self.last_request_at
         tel = self.telemetry.snapshot() if getattr(self, "telemetry", None) else {"now": {}, "static": {}}
         hw, static = tel.get("now") or {}, tel.get("static") or {}
@@ -3624,7 +3663,8 @@ class Service:
                             "requested": max(1, int(getattr(self.engine, "batch", 0) or 0))},
             "dialects": ["/v1/chat/completions", "/v1/messages", "/v1/responses"],
             "vision": {"enabled": images, "available": images, "error": None,
-                       **({"loaded": not self._vision_down(), "idle_unload_s": self.vision_idle_unload_s}
+                       **({"loaded": not self._vision_down(), "idle_unload_s": self.vision_idle_unload_s,
+                           "last_unload": vision_last_unload}
                           if self.vision_idle_unload_s else {})},
             "activity": {"requests": totals["requests"] + int(busy), "in_flight": int(busy) + int(s.get("queued") or 0),
                          "last_request_at": int(last_at) if last_at else None},

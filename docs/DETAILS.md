@@ -604,6 +604,40 @@ and confirmed `vision stage=idle_unload elapsed_s=...`. A process that fails to
 exit remains owned and blocks replacement; it is not reported as successfully
 unloaded. The idle worker stops when its HTTP server closes.
 
+The successful idle-unload log also reports fresh before/after memory readings:
+each monitored GPU's used MiB, system used RAM, and the encoder's RSS before exit
+(working set on Windows). Windows private commit is reported when available.
+`decrease` means before minus after and can be negative. GPU readings cover whole
+monitored cards and RAM readings cover the system; other programs, OS file caches
+and delayed driver accounting affect them. They are not exact encoder savings.
+The sampled GPUs include the existing telemetry devices plus an explicitly
+numbered `vision.cuda_device`, if configured. This does not change Monitor GPU
+aggregates. Custom device mappings outside those settings are not resolved.
+Missing readings say `unavailable`, not zero.
+No CPU percentage is inferred from two instantaneous snapshots; process exit
+confirms that the encoder no longer has running CPU threads.
+
+`GET /v1/status` retains the latest successful event as `vision.last_unload`,
+with `at`, `elapsed_s`, `process_exited`, `scope: whole_devices_and_system`,
+and `before`/`after` snapshots. Each
+snapshot includes its timestamp, `gpus` (`index`, `used_mib`),
+`system_ram_used_mib`, `process_rss_mib` and `process_private_mib`. Unavailable
+values, including process memory after exit, are `null`. Before any successful
+idle unload, `last_unload` is `null`; a failed unload does not publish a success.
+The record stays in memory only and keeps its original timestamp after reload.
+Sampling does not advance the Monitor's CPU/disk rate history and is best effort;
+missing telemetry does not prevent resource release.
+
+Development observations for this reporting change used Linux without GPU
+readings: direct sampling of a live OS `sleep` process reported 1.93 MiB RSS;
+after terminating and waiting for it, process readings were `null`. Both the
+default GPU and an additional requested GPU were retained with `null` readings.
+A temporary loopback server returned `vision.last_unload: null` before any
+unload and served a text Responses request with HTTP 200 `completed`. These
+observations check sampling and the API, not native encoder unloading. Real
+Windows working-set/private-commit and GPU before/after measurements remain to
+be observed on the deployed model.
+
 Unloading preserves the vision work directory, image embeddings and uploaded
 video references. A restarted encoder has a new video-cache identity, so a valid
 file ID can be reused but its visual preprocessing is performed again. See

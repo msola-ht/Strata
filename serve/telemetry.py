@@ -328,7 +328,7 @@ class _CpuRamFallback:
 
 # ------------------------------------------------------------------------------------------------ the sampler
 class Telemetry:
-    def __init__(self, extra=None, gpu_index=0, gpu_indices=None, amd=False):
+    def __init__(self, extra=None, gpu_index=0, gpu_indices=None, amd=False, resource_gpu_index=None):
         """`extra()` -> dict of more series to record each second (the server's tok/s).  `gpu_index`: the card the
         engine runs on, numbered as nvidia-smi and NVML number them (by PCI bus); `gpu_indices`: all of them when
         the model is split across several (issue #112) - the gpu_* readings are then their total (memory, power,
@@ -342,6 +342,11 @@ class Telemetry:
         self.gpus = [(i, gpu_reader(i, amd)) for i in idx]
         self.gpus = [(i, g) for i, g in self.gpus if g.ok()] or self.gpus[:1]
         self.gpu = self.gpus[0][1]
+        # Lifecycle observations can include a separately placed encoder without
+        # changing the Monitor's GPU aggregates or engine stall detector.
+        self.resource_gpus = list(self.gpus)
+        if resource_gpu_index is not None and resource_gpu_index not in [i for i, _ in self.resource_gpus]:
+            self.resource_gpus.append((resource_gpu_index, gpu_reader(resource_gpu_index, amd)))
         try:
             import psutil  # noqa: F401
             self.ps = sys.modules["psutil"]
@@ -420,6 +425,44 @@ class Telemetry:
     def close(self):
         """Ends the sampler thread (a server that stops, a test's service): it used to run for the life of the process."""
         self._stop.set()
+
+    def resource_snapshot(self, process=None):
+        """Fresh memory readings for a lifecycle event, without advancing rate/history samplers.
+
+        GPU values cover the monitored devices, not one process. Missing readings
+        stay None; process RSS is a working set on Windows, private is commit.
+        """
+        out = {"at": time.time(), "gpus": [], "system_ram_used_mib": None,
+               "process_rss_mib": None, "process_private_mib": None}
+        for index, gpu in self.resource_gpus:
+            used = None
+            try:
+                used = gpu.read().get("mem_used") if gpu.ok() else None
+            except Exception:  # noqa: BLE001 - observation must never prevent cleanup
+                pass
+            out["gpus"].append({"index": index, "used_mib": used / 2**20 if used is not None else None})
+        try:
+            if self.ps:
+                vm = self.ps.virtual_memory()
+                used = vm.total - vm.available
+            else:
+                used, _ = self.fallback.ram()
+            out["system_ram_used_mib"] = used / 2**20 if used is not None else None
+        except Exception:  # noqa: BLE001
+            pass
+        if self.ps and process is not None:
+            try:
+                if process.poll() is None:
+                    memory = self.ps.Process(process.pid).memory_info()
+                    # The process can exit during the read. Do not publish a
+                    # reading from a reused PID as the encoder's memory.
+                    if process.poll() is None:
+                        out["process_rss_mib"] = memory.rss / 2**20
+                        private = getattr(memory, "private", None)
+                        out["process_private_mib"] = private / 2**20 if private is not None else None
+            except Exception:  # noqa: BLE001
+                pass
+        return out
 
     def _loop(self):
         while not self._stop.is_set():
