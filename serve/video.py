@@ -21,6 +21,7 @@ import sys
 import threading
 import time
 import urllib.request
+import uuid
 
 
 class VideoError(ValueError):
@@ -80,8 +81,10 @@ def policy(config):
         raise VideoError("vision.video must be an object with enabled: true or false")
     if not config.get("enabled", False):
         return None
-    if set(config) - set(DEFAULTS) - {"enabled"}:
+    if set(config) - set(DEFAULTS) - {"enabled", "diagnostics"}:
         raise VideoError("unknown vision.video setting")
+    if not isinstance(config.get("diagnostics", False), bool):
+        raise VideoError("vision.video.diagnostics must be true or false")
     result = {**DEFAULTS, **{k: v for k, v in config.items() if k != "enabled"}}
     for key, ceiling in CEILINGS.items():
         value = result[key]
@@ -99,12 +102,59 @@ class Budget:
     def __init__(self, settings, cancel):
         self.settings, self.cancel = dict(settings), cancel
         self.deadline = time.monotonic() + settings["deadline_s"]
+        self.trace = Trace(settings.get("diagnostics", False))
+        self.current_stage = "preparation"
 
     def check(self):
         if self.cancel.is_set():
-            raise VideoError("video preparation cancelled")
+            raise VideoStageError(self.current_stage, "video preparation cancelled")
         if time.monotonic() >= self.deadline:
-            raise VideoError("video preparation deadline exceeded")
+            raise VideoStageError(self.current_stage, "video preparation deadline exceeded")
+
+    @contextlib.contextmanager
+    def stage(self, name):
+        previous, self.current_stage = self.current_stage, name
+        try:
+            with self.trace.stage(name, self.cancel, self.deadline):
+                try:
+                    yield
+                except VideoError as error:
+                    if isinstance(error, (VideoStageError, VideoContextError)):
+                        raise
+                    raise VideoStageError(name, str(error)) from None
+        finally:
+            self.current_stage = previous
+
+
+class Trace:
+    """Opt-in, bounded stage events: generated IDs only, never request payloads."""
+    def __init__(self, enabled):
+        self.enabled = enabled
+        self.id = uuid.uuid4().hex
+
+    def event(self, stage, **fields):
+        if self.enabled:
+            details = " ".join(f"{key}={value}" for key, value in fields.items())
+            print(f"[strata] video trace={self.id} stage={stage} {details}", flush=True)
+
+    @contextlib.contextmanager
+    def stage(self, name, cancel=None, deadline=None, timeout_errors=()):
+        started = time.monotonic()
+        self.event(name, event="start")
+        outcome = "ok"
+        try:
+            yield
+        except BaseException as error:
+            code = getattr(error, "code", "") or ""
+            cancelled = (cancel is not None and cancel.is_set()) or code.endswith("_cancelled")
+            timed_out = isinstance(error, timeout_errors) or code.endswith("_timeout") \
+                or (deadline is not None and time.monotonic() >= deadline)
+            outcome = "cancelled" if cancelled else "timeout" if timed_out else "failed"
+            raise
+        finally:
+            if outcome == "ok" and cancel is not None and cancel.is_set():
+                outcome = "cancelled"
+            self.event(name, event="end", outcome=outcome, elapsed_s=f"{time.monotonic()-started:.3f}")
 
 
 @contextlib.contextmanager
@@ -161,29 +211,58 @@ def prepare(source, directory, budget, *, local_file=None):
         proc = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), str(request)],
                                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=stderr,
                                 start_new_session=os.name == "posix")
+        observed = []
+
+        def progress():
+            # Each marker is written once. Replacing a marker while this reader
+            # has it open can fail with a sharing violation on Windows.
+            expected = (("source", "download"), ("decode",), ("sampling",), ("ready",))
+            while len(observed) < len(expected):
+                try:
+                    with (directory / f"stage-{len(observed)}.json").open() as marker:
+                        event = json.loads(marker.read(1024))
+                except (OSError, ValueError):
+                    return  # A newly created marker may not have been fully written yet.
+                if not isinstance(event, list) or len(event) != 2:
+                    return
+                name, started = event
+                if name not in expected[len(observed)] or isinstance(started, bool) \
+                        or not isinstance(started, (int, float)) or not math.isfinite(started) \
+                        or (observed and started < observed[-1][1]):
+                    return
+                if observed:
+                    previous, before = observed[-1]
+                    budget.trace.event(previous, event="end", outcome="ok", elapsed_s=f"{started-before:.3f}")
+                observed.append((name, started))
+                if name != "ready":
+                    budget.current_stage = name
+                    budget.trace.event(name, event="start")
+
         try:
             while proc.poll() is None:
+                progress()
                 budget.check()
                 if log.stat().st_size > 65536:
                     raise VideoError("video worker diagnostic limit exceeded")
                 time.sleep(0.05)
             budget.check()
+            progress()
             if proc.returncode:
                 message = (directory / "error.json")
                 detail = json.loads(message.read_text()) if message.is_file() else "video worker failed"
                 raise VideoError(detail)
         except VideoError as e:
-            if local_file is not None:
-                stage_file = directory / "stage.json"
-                try:
-                    stage = json.loads(stage_file.read_text())
-                except (OSError, ValueError):
-                    stage = "decode"
-                raise VideoStageError(stage, str(e)) from None
-            raise
+            progress()
+            stage = observed[-1][0] if observed and observed[-1][0] != "ready" else "preparation"
+            if observed and observed[-1][0] != "ready":
+                budget.trace.event(stage, event="end", outcome="cancelled" if budget.cancel.is_set() else
+                                   "timeout" if time.monotonic() >= budget.deadline else "failed",
+                                   elapsed_s=f"{time.monotonic()-observed[-1][1]:.3f}")
+            raise VideoStageError(stage, str(e)) from None
         finally:
             stop(proc)
             request.unlink(missing_ok=True)
+            budget.current_stage = "preparation"
     return directory / "frames.svf"
 
 
@@ -228,8 +307,16 @@ def _command(args, output, limit):
 def _worker(request):
     directory = request.parent
     spec = json.loads(request.read_text(encoding="utf-8"))
-    record_stage = spec.get("local_file") is not None
+    stages = []
+
+    def record_stage(name):
+        marker = directory / f"stage-{len(stages)}.json"
+        event = (name, time.monotonic())
+        marker.write_text(json.dumps(event))
+        stages.append(event)
+
     p, source = spec["settings"], spec["source"]
+    record_stage("source" if spec.get("local_file") is not None or source.startswith("data:") else "download")
     source_file = directory / "source.bin"
     if spec.get("local_file") is not None:
         # Only the authenticated store supplies this field; it is never read from an API part.
@@ -276,8 +363,7 @@ def _worker(request):
     request.unlink(missing_ok=True)
     common = ["-v", "error", "-protocol_whitelist", "file,pipe", "-format_whitelist", "mov,matroska,avi,mpegts"]
     probe = directory / "probe.json"
-    if record_stage:
-        (directory / "stage.json").write_text(json.dumps("decode"))
+    record_stage("decode")
     _command([p["ffprobe"], *common, "-threads", "1", "-select_streams", "v:0", "-show_frames", "-show_streams",
               "-show_entries", "stream=width,height,duration,sample_aspect_ratio:stream_side_data=rotation:frame=best_effort_timestamp_time,width,height,duration_time,pkt_duration_time",
               "-of", "json", str(source_file)], probe, 16 << 20)
@@ -314,8 +400,7 @@ def _worker(request):
         raise VideoError("video metadata is missing or invalid") from None
     # Nearest source PTS at a fixed grid; earlier frame wins ties. Always retain
     # the last frame; reject excess cost instead of silently reducing cadence.
-    if record_stage:
-        (directory / "stage.json").write_text(json.dumps("sampling"))
+    record_stage("sampling")
     chosen = set()
     fps = Decimal(str(p["fps"]))
     for k in range(math.floor(times[-1] * fps) + 1):
@@ -349,6 +434,7 @@ def _worker(request):
     raw.unlink()
     source_file.unlink()
     probe.unlink()
+    record_stage("ready")
 
 
 if __name__ == "__main__":

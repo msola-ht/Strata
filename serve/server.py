@@ -3864,9 +3864,12 @@ class Service:
                 cached = getattr(self.embeddings, "cached_video", None)
                 if cached is None:
                     packet = video_api.prepare(videos[0], directory, budget)
-                with video_api.acquire(self.fifo, budget):
+                with contextlib.ExitStack() as turn:
+                    with budget.stage("encode_queue"):
+                        turn.enter_context(video_api.acquire(self.fifo, budget))
                     if cached is None:
-                        output, _, layout = self.vision.encode_video(packet, Path(directory) / "video.sve", budget)
+                        with budget.stage("encode"):
+                            output, _, layout = self.vision.encode_video(packet, Path(directory) / "video.sve", budget)
                     else:
                         artifact, layout, identity = cached
                         if identity != self.vision.video_identity:
@@ -3876,7 +3879,7 @@ class Service:
                         except (ValueError, OSError):
                             raise video_store.StoreError("video_cache_corrupt", "invalid cached video artifact", 503) from None
                         output = Path(directory) / "video.sve"
-                        with Path(artifact).open("rb") as source, output.open("wb") as target:
+                        with budget.stage("artifact_copy"), Path(artifact).open("rb") as source, output.open("wb") as target:
                             while chunk := source.read(65536):
                                 budget.check()
                                 target.write(chunk)  # cache lease stays pinned; run() owns only this copy
@@ -3893,6 +3896,8 @@ class Service:
                     if room < 1 or (max_new and max_new > room and not self.fit_max_tokens):
                         raise video_api.VideoContextError("video request exceeds the context window; reduce video or output budget")
                     max_new = room if max_new is None or max_new <= 0 else min(room, max_new)
+                    budget.trace.event("prompt", tokens=len(ids), visual_tokens=sum(cells for _, cells in layout),
+                                       context=ctx)
                     budget.check()
                     combined = self.vision.dir / ("video-request-" + uuid.uuid4().hex + ".sve")
                     self.embeddings.path = combined
@@ -3908,6 +3913,22 @@ class Service:
         return ids, kwargs.get("enable_thinking", True) is not False, max_new
 
     @contextlib.contextmanager
+    def video_producer(self, source):
+        """A shared producer outlives its last HTTP waiter while codecs are stopping."""
+        with self.status_lock:
+            if self._unloading:
+                raise video_store.StoreError("video_unavailable", "model is unloading", 503)
+            self._video_requests += 1
+        try:
+            with self.video_store.retain(source):
+                yield
+        finally:
+            with self.status_lock:
+                self._video_requests -= 1
+                self.last_request_at = time.time()
+                self._vision_last_used = time.monotonic()
+
+    @contextlib.contextmanager
     def cached_video(self, owner, file_id, budget):
         store, vision = self.video_store, self.vision
         identity = vision.video_identity
@@ -3920,23 +3941,29 @@ class Service:
                 cancel = own_budget.cancel
                 stage, started = "queue", time.monotonic()
                 try:
-                    with video_api.acquire(self.video_cache_slot, own_budget):
+                    with contextlib.ExitStack() as admission:
+                        with own_budget.stage("queue"):
+                            admission.enter_context(video_api.acquire(self.video_cache_slot, own_budget))
                         admitted = time.monotonic()
                         with tempfile.TemporaryDirectory(prefix="video-cache-", dir=vision.dir) as directory:
                             stage = "decode"
                             packet = video_api.prepare("", directory, own_budget, local_file=source.path)
                             decoded = time.monotonic()
                             stage = "queue"
-                            with video_api.acquire(self.fifo, own_budget):
+                            with contextlib.ExitStack() as turn:
+                                with own_budget.stage("encode_queue"):
+                                    turn.enter_context(video_api.acquire(self.fifo, own_budget))
                                 if identity != vision.video_identity:
                                     raise video_api.VideoError("video encoder changed; retry the request")
                                 stage = "encode"
                                 encoding = time.monotonic()
-                                output, _, layout = vision.encode_video(packet, Path(directory) / "video.sve", own_budget)
+                                with own_budget.stage("encode"):
+                                    output, _, layout = vision.encode_video(packet, Path(directory) / "video.sve", own_budget)
                                 encoded = time.monotonic()
                             video_api.validate_artifact(output, layout, settings)
                             own_budget.check()
-                            store.copy_artifact(output, target, cancel)
+                            with own_budget.stage("artifact_store"):
+                                store.copy_artifact(output, target, cancel)
                             own_budget.check()
                             print(f"[strata] video stage=preprocess queue_s={admitted-started:.3f} "
                                   f"decode_sampling_s={decoded-admitted:.3f} encode_queue_s={encoding-decoded:.3f} "
@@ -3945,10 +3972,14 @@ class Service:
                 except video_api.VideoError as e:
                     stage = getattr(e, "stage", stage)
                     suffix = "cancelled" if cancel.is_set() else "timeout" if time.monotonic() >= own_budget.deadline else "failed"
-                    raise video_store.StoreError(f"video_{stage}_{suffix}", f"video {stage} {suffix}: {e}", 400) from None
+                    raise video_store.StoreError(f"video_{stage}_{suffix}", f"video {stage} {suffix}: {e}",
+                                                 499 if suffix == "cancelled" else 408 if suffix == "timeout" else 400) from None
 
             started = time.monotonic()
-            with store.get_or_compute(key, budget, compute, producer_context=store.retain(source)) as (artifact, layout, hit):
+            with contextlib.ExitStack() as leases:
+                with budget.stage("cache_wait"):
+                    artifact, layout, hit = leases.enter_context(store.get_or_compute(
+                        key, budget, compute, producer_context=self.video_producer(source)))
                 print(f"[strata] video cache={hit} wait_s={time.monotonic()-started:.3f}", flush=True)
                 yield artifact, layout, identity
 
@@ -4144,6 +4175,10 @@ class Service:
         segments = []
         trace = getattr(self.request_trace, "record", None)
         waiting = time.perf_counter()
+        video_trace = getattr(self.embeddings, "video_trace", None)
+        video_queue = contextlib.ExitStack()
+        if video_trace is not None:
+            video_queue.enter_context(video_trace.stage("generation_queue", cancel))
         # #465: with "parallel" (the engine's batch slots) requests run at once: each keeps its own status and rate
         # window (self.status says busy while any runs); one at a time they are self.status / self.rate, as before
         par = bool(getattr(self.engine, "batch", 0))
@@ -4179,6 +4214,9 @@ class Service:
                                    "reasoning_tokens": 0, "reasoning_recoveries": 0}
                     return
             with turn:
+                video_queue.close()
+                if video_trace is not None:
+                    turn.enter_context(video_trace.stage("generation", cancel, timeout_errors=(EngineSilent,)))
                 try:
                     with self.status_lock:
                         if trace is not None:
@@ -4515,6 +4553,7 @@ class Service:
                                 self.status.pop("tail", None)
                                 self.status.pop("tool", None)
         finally:
+            video_queue.__exit__(*sys.exc_info())
             if emb:
                 Path(emb).unlink(missing_ok=True)
         for ev in cut(parser.finish(finish)):
@@ -5944,7 +5983,7 @@ def make_handler(svc: Service):
                 return validated_json(text, validator, finish)
 
             def generation_code(error):
-                if not getattr(self, "video_file_request", False):
+                if not getattr(self, "video_file_request", False) and not getattr(getattr(self, "video_trace", None), "enabled", False):
                     return "server_error"
                 return "video_generation_timeout" if isinstance(error, EngineSilent) else "video_generation_failed"
 
@@ -6054,6 +6093,8 @@ def make_handler(svc: Service):
             cancel = self.video_cancel = threading.Event()
             self._watch_client(cancel)
             budget = video_api.Budget(svc.vision.video_policy, cancel)
+            self.video_trace = budget.trace
+            budget.trace.event("request", event="start", source="file" if file_id is not None else "url")
             asm = responses_api.Assembler(req, svc.model_for(req), 0, names, False)
 
             def send(e):
@@ -6090,9 +6131,10 @@ def make_handler(svc: Service):
                         last = time.monotonic()
 
                 if file_id is None:
-                    while not held:
-                        beat()
-                        held = svc.video_slot.acquire(timeout=0.1)
+                    with budget.stage("queue"):
+                        while not held:
+                            beat()
+                            held = svc.video_slot.acquire(timeout=0.1)
 
                 def prepare():
                     nonlocal held
@@ -6105,9 +6147,10 @@ def make_handler(svc: Service):
                                 cached = getattr(svc.embeddings, "cached_video", None)
                                 if cached is None:
                                     cached = leases.enter_context(svc.cached_video(self._file_owner(), file_id, budget))
-                                while not held:
-                                    budget.check()
-                                    held = svc.video_slot.acquire(timeout=0.1)
+                                with budget.stage("queue"):
+                                    while not held:
+                                        budget.check()
+                                        held = svc.video_slot.acquire(timeout=0.1)
                                 return cached
                             if file_id is not None:
                                 svc.embeddings.acquire_video = acquire_video
@@ -6142,6 +6185,7 @@ def make_handler(svc: Service):
                     prepared_asm.seq = asm.seq
                 asm = prepared_asm
                 svc.embeddings.path = box.pop("path", None)
+                svc.embeddings.video_trace = budget.trace
                 self.video_prepared = result
                 with svc.status_lock:
                     svc.status["queued"] -= 1
@@ -6154,10 +6198,12 @@ def make_handler(svc: Service):
                 if getattr(self, "video_stage", None) == "load" and isinstance(e, video_api.VideoError):
                     code = "video_load_cancelled" if cancel.is_set() else "video_load_timeout"
                     e = ResponsesError(str(e), "input", code, status=499 if cancel.is_set() else 408)
-                elif file_id is not None and isinstance(e, video_api.VideoError):
-                    code = "video_queue_timeout" if time.monotonic() >= budget.deadline else \
-                        "video_preparation_cancelled" if cancel.is_set() else "video_preparation_failed"
-                    e = video_store.StoreError(code, str(e), 408 if code.endswith("timeout") else 400)
+                elif (file_id is not None or budget.trace.enabled) and isinstance(e, video_api.VideoError):
+                    stage = getattr(e, "stage", "preparation")
+                    suffix = "cancelled" if cancel.is_set() else "timeout" if time.monotonic() >= budget.deadline else "failed"
+                    e = video_store.StoreError(f"video_{stage}_{suffix}", str(e),
+                                              499 if suffix == "cancelled" else 408 if suffix == "timeout" else 400)
+                budget.trace.event("request", event="error", code=getattr(e, "code", None) or "video_preparation_failed")
                 cancel.set()
                 message = str(e) if isinstance(e, (ValueError, EngineDied)) else "video preparation failed"
                 if getattr(self, "video_stream_started", False):
@@ -6180,6 +6226,7 @@ def make_handler(svc: Service):
                         Path(path).unlink(missing_ok=True)
                     svc.drop_embeddings()
                 finally:
+                    svc.embeddings.video_trace = None
                     if held:
                         svc.video_slot.release()
                     with svc.status_lock:
@@ -6189,6 +6236,7 @@ def make_handler(svc: Service):
                             svc._video_requests -= 1
                             svc.last_request_at = time.time()
                             svc._vision_last_used = time.monotonic()
+                    budget.trace.event("cleanup", event="released", scope="request")
 
         def _responses_failed(self, asm, message, code, send):
             e = asm.failed(message, code)
@@ -6239,8 +6287,11 @@ def make_handler(svc: Service):
                 if svc.vision_idle_unload_s:
                     self.video_stage = "load"
                     try:
-                        with video_api.acquire(svc.fifo, video_budget):
-                            svc.ensure_vision_loaded(video_budget)
+                        with contextlib.ExitStack() as turn:
+                            with video_budget.stage("load_queue"):
+                                turn.enter_context(video_api.acquire(svc.fifo, video_budget))
+                            with video_budget.stage("load"):
+                                svc.ensure_vision_loaded(video_budget)
                     except video_api.VideoError:
                         raise
                     except Exception as e:
@@ -6266,12 +6317,10 @@ def make_handler(svc: Service):
             except (ResponsesError, video_store.StoreError):
                 raise
             except ValueError as e:                          # too long for the context, an image without vision
-                if getattr(self, "video_file_request", False) and isinstance(e, video_api.VideoError) \
-                        and not isinstance(e, video_api.VideoContextError) and video_budget is not None:
-                    if time.monotonic() >= video_budget.deadline:
-                        raise video_store.StoreError("video_preparation_timeout", "video preparation deadline exceeded", 408) from None
-                    if video_budget.cancel.is_set():
-                        raise video_store.StoreError("video_preparation_cancelled", "video preparation cancelled", 499) from None
+                if isinstance(e, video_api.VideoError) and not isinstance(e, video_api.VideoContextError) \
+                        and video_budget is not None and (getattr(self, "video_file_request", False)
+                                                          or video_budget.trace.enabled):
+                    raise  # Preserve the stage and cancellation state through the HTTP error boundary.
                 raise ResponsesError(str(e), "input", "context_length_exceeded" if "context" in str(e) else None) \
                     from None
             if svc.codex_compaction_cache:

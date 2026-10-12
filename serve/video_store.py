@@ -361,7 +361,8 @@ class VideoStore:
             raise StoreError("invalid_request", "invalid video content digest")
         if not isinstance(model_identity, str) or not model_identity:
             raise StoreError("invalid_request", "video encoder identity is required")
-        payload = json.dumps(["video-cache-v1", sha256, settings, model_identity],
+        effective = {k: v for k, v in settings.items() if k != "diagnostics"}
+        payload = json.dumps(["video-cache-v1", sha256, effective, model_identity],
                              sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
         return hashlib.sha256(payload).hexdigest()
 
@@ -406,22 +407,26 @@ class VideoStore:
         acquired = False
         result = error = None
         try:
-            while not acquired:
-                flight.budget.check()
-                acquired = self._workers.acquire(timeout=0.1)
+            with flight.budget.stage("producer_queue"):
+                while not acquired:
+                    flight.budget.check()
+                    acquired = self._workers.acquire(timeout=0.1)
             flight.budget.check()
             layout = compute(flight.budget, flight.path)
             encoded = json.dumps(layout, separators=(",", ":"), allow_nan=False)
             if len(encoded.encode()) > 65536:
                 raise StoreError("invalid_request", "video layout exceeds its size budget")
-            size, digest = self._artifact_digest(flight.path, flight.budget.check)
+            with flight.budget.stage("checksum"):
+                size, digest = self._artifact_digest(flight.path, flight.budget.check)
             flight.budget.check()
             result = _Cache(flight.key, flight.path, encoded, size, digest,
                             time.monotonic() + self.settings["cache_ttl_s"], time.monotonic())
         except Exception as exc:
             if isinstance(exc, VideoError):
-                code = "video_preparation_cancelled" if flight.cancel.is_set() else "video_preparation_timeout"
-                error = StoreError(code, str(exc), 499 if flight.cancel.is_set() else 408)
+                suffix = "cancelled" if flight.cancel.is_set() else \
+                    "timeout" if time.monotonic() >= flight.budget.deadline else "failed"
+                code = f"video_{getattr(exc, 'stage', 'preparation')}_{suffix}"
+                error = StoreError(code, str(exc), 499 if suffix == "cancelled" else 408 if suffix == "timeout" else 400)
             else:
                 error = exc if isinstance(exc, StoreError) else StoreError(
                     "video_preparation_failed", "video preparation failed", 502)
@@ -459,6 +464,8 @@ class VideoStore:
                     self._flights.pop(flight.key, None)
                 self._condition.notify_all()
                 self._finish_close()
+            flight.budget.trace.event("publication", event="result", outcome="ok" if flight.result else "failed",
+                                     code=error.code if error else "none")
 
     @contextlib.contextmanager
     def get_or_compute(self, key, budget, compute, *, producer_context=None):
@@ -517,6 +524,7 @@ class VideoStore:
                         flight.waiters += 1
                         hit = "shared"
                     break
+            budget.trace.event("cache", result=hit, producer=flight.budget.trace.id if flight else "none")
             if flight is not None:
                 while True:
                     budget.check()
