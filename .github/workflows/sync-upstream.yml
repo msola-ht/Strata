@@ -1,12 +1,13 @@
 # Keep this fork on top of upstream (Niko1221/Strata), whatever upstream does: every run takes upstream/main as
-# it is, brings it into main, and replays the patch branches on top of it. Nothing here decides whether an
-# upstream move is worth taking - a run with nothing new is a no-op, a run after an upstream push moves the
-# branches. A patch branch that stops on a conflict ends the run; that rebase is finished by hand, and the next
-# run starts from the branches as they are then.
+# it is, brings it into main, merges main into dev, and replays the patch branches on top of it. Nothing here
+# decides whether an upstream move is worth taking - a run with nothing new is a no-op, a run after an upstream
+# push moves the branches. A patch branch that stops on a conflict ends the run; that rebase is finished by
+# hand, and the next run starts from the branches as they are then.
 #
 # main is upstream's main plus this file, so the merge is a fast-forward until something else is added to main
-# here. The patch branches are rewritten (rebase), so they are pushed with --force-with-lease. Everything is
-# pushed with the workflow's own token, and a push with that token starts no workflow: this cannot loop.
+# here. The patch branches are rewritten (rebase), so they are pushed with --force-with-lease; dev is merged
+# instead, so the pull requests that land in dev keep a base that never moves under them. Everything is pushed
+# with the workflow's own token, and a push with that token starts no workflow: this cannot loop.
 name: sync-upstream
 
 on:
@@ -20,7 +21,7 @@ on:
         default: ""
 
 permissions:
-  contents: write                         # pushing main and the rebased patch branches back to the fork
+  contents: write                         # pushing main, dev and the rebased patch branches back to the fork
 
 concurrency:
   group: sync-upstream                    # one sync at a time; a queued run waits, it does not cancel
@@ -146,3 +147,61 @@ jobs:
             } >> "$GITHUB_STEP_SUMMARY"
             echo "== $branch: $old -> $after"
           done
+
+  sync-dev:
+    name: Merge main into dev
+    needs: sync-main
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: dev
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: merge main into dev
+        run: |
+          set -euo pipefail
+          git config user.name "strata-sync"
+          git config user.email "strata-sync@users.noreply.github.com"
+          git fetch origin main dev
+          git checkout dev
+          before=$(git rev-parse HEAD)
+          synced_main=$(git rev-parse origin/main)
+          # A plain merge: dev is the fork's own integration branch, so its commits are never rewritten and a
+          # pull request that was merged into it stays valid. The patch branches above are rebased instead.
+          if ! git merge --no-edit origin/main; then
+            git merge --abort
+            {
+              echo "### dev: main did not merge"
+              echo
+              echo "main is at \`$synced_main\`, and dev does not merge it cleanly."
+              echo "dev was not pushed: it still points at \`$before\`."
+              echo
+              echo "Finish it by hand:"
+              echo
+              echo '```'
+              echo "git fetch origin"
+              echo "git switch dev"
+              echo "git merge origin/main                  # resolve, git add, git commit"
+              echo "git push origin dev"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::dev does not merge main - resolve it by hand (see the run summary)"
+            exit 1
+          fi
+          after=$(git rev-parse HEAD)
+          if [[ "$after" != "$before" ]]; then
+            git push origin dev
+          fi
+          git fetch origin dev
+          git merge-base --is-ancestor "$after" origin/dev
+          git merge-base --is-ancestor "$synced_main" origin/dev
+          {
+            echo "### dev merged"
+            echo "Before: $before"
+            echo "main: $synced_main"
+            echo "After: $after"
+            echo "Verified: origin/dev contains the fetched main commit."
+          } >> "$GITHUB_STEP_SUMMARY"
