@@ -31,6 +31,37 @@ class VideoContextError(VideoError):
     pass
 
 
+class VideoStageError(VideoError):
+    def __init__(self, stage, message):
+        super().__init__(message)
+        self.stage = stage
+
+
+def validate_artifact(path, layout, settings):
+    """Check every SVE1 record and timestamp before reuse; never trust a cached token count."""
+    if not layout or len(layout) > (settings["max_frames"] + 1) // 2:
+        raise VideoError("invalid cached video layout")
+    total, previous = 0, -1.0
+    with Path(path).open("rb") as source:
+        for seconds, cells in layout:
+            if not math.isfinite(seconds) or not previous < seconds <= settings["max_duration_s"] \
+                    or not isinstance(cells, int) or not 0 < cells <= 1024:
+                raise VideoError("invalid cached video timestamp or cells")
+            header = source.read(20)
+            if len(header) != 20:
+                raise VideoError("incomplete cached video header")
+            magic, rows, nx, ny, width = struct.unpack("<5I", header)
+            if magic != 0x31455653 or rows != cells or nx * ny != rows or width != 2560:
+                raise VideoError("invalid cached video embeddings")
+            source.seek(rows * width * 4, 1)
+            if source.tell() > Path(path).stat().st_size:
+                raise VideoError("incomplete cached video embeddings")
+            total += rows
+            previous = seconds
+        if source.read(1) or total > settings["max_tokens"]:
+            raise VideoError("cached video exceeds current limits")
+
+
 DEFAULTS = {"fps": 2.0, "max_duration_s": 120.0, "max_frames": 256,
             "max_source_bytes": 64 << 20, "max_source_frames": 32768,
             "max_source_pixels": 16 << 20, "pair_tokens": 256,
@@ -103,10 +134,10 @@ def stop(proc):
         raise VideoError("video worker did not stop") from None
 
 
-def prepare(source, directory, budget):
+def prepare(source, directory, budget, *, local_file=None):
     """One video per request: bounded source, packet and artifact disk ownership."""
     settings = budget.settings
-    if not source.startswith(("http://", "https://", "data:")):
+    if local_file is None and not source.startswith(("http://", "https://", "data:")):
         raise VideoError("video_url must be an http(s) or base64 data: URL; local paths are not accepted")
     if len(source) > (settings["max_source_bytes"] * 4 // 3 + 4096):
         raise VideoError("video source exceeds its byte budget")
@@ -115,8 +146,11 @@ def prepare(source, directory, budget):
             raise VideoError(f"video requires {key}; configure vision.video.{key}")
     directory = Path(directory)
     request = directory / "source.json"
+    spec = {"source": source, "settings": settings}
+    if local_file is not None:
+        spec["local_file"] = str(local_file)
     with request.open("w", encoding="utf-8") as out:
-        for part in json.JSONEncoder().iterencode({"source": source, "settings": settings}):
+        for part in json.JSONEncoder().iterencode(spec):
             for at in range(0, len(part), 65536):
                 budget.check()
                 out.write(part[at:at + 65536])
@@ -138,6 +172,15 @@ def prepare(source, directory, budget):
                 message = (directory / "error.json")
                 detail = json.loads(message.read_text()) if message.is_file() else "video worker failed"
                 raise VideoError(detail)
+        except VideoError as e:
+            if local_file is not None:
+                stage_file = directory / "stage.json"
+                try:
+                    stage = json.loads(stage_file.read_text())
+                except (OSError, ValueError):
+                    stage = "decode"
+                raise VideoStageError(stage, str(e)) from None
+            raise
         finally:
             stop(proc)
             request.unlink(missing_ok=True)
@@ -185,9 +228,16 @@ def _command(args, output, limit):
 def _worker(request):
     directory = request.parent
     spec = json.loads(request.read_text(encoding="utf-8"))
+    record_stage = spec.get("local_file") is not None
     p, source = spec["settings"], spec["source"]
     source_file = directory / "source.bin"
-    if source.startswith("data:"):
+    if spec.get("local_file") is not None:
+        # Only the authenticated store supplies this field; it is never read from an API part.
+        local = Path(spec["local_file"])
+        if not 0 < local.stat().st_size <= p["max_source_bytes"]:
+            raise VideoError("video source exceeds its byte budget")
+        shutil.copyfile(local, source_file)
+    elif source.startswith("data:"):
         head, comma, data = source.partition(",")
         if not comma or not head.startswith("data:video/") or not head.endswith(";base64"):
             raise VideoError("video data URL requires a video MIME type and base64 encoding")
@@ -226,6 +276,8 @@ def _worker(request):
     request.unlink(missing_ok=True)
     common = ["-v", "error", "-protocol_whitelist", "file,pipe", "-format_whitelist", "mov,matroska,avi,mpegts"]
     probe = directory / "probe.json"
+    if record_stage:
+        (directory / "stage.json").write_text(json.dumps("decode"))
     _command([p["ffprobe"], *common, "-threads", "1", "-select_streams", "v:0", "-show_frames", "-show_streams",
               "-show_entries", "stream=width,height,duration,sample_aspect_ratio:stream_side_data=rotation:frame=best_effort_timestamp_time,width,height,duration_time,pkt_duration_time",
               "-of", "json", str(source_file)], probe, 16 << 20)
@@ -262,6 +314,8 @@ def _worker(request):
         raise VideoError("video metadata is missing or invalid") from None
     # Nearest source PTS at a fixed grid; earlier frame wins ties. Always retain
     # the last frame; reject excess cost instead of silently reducing cadence.
+    if record_stage:
+        (directory / "stage.json").write_text(json.dumps("sampling"))
     chosen = set()
     fps = Decimal(str(p["fps"]))
     for k in range(math.floor(times[-1] * fps) + 1):

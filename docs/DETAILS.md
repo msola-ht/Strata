@@ -1586,7 +1586,9 @@ Example request body (use the deployment's API key in the Authorization header):
 }
 ```
 
-`video_url` can also be `{"url": "..."}` or a `data:video/mp4;base64,...` string. Local paths, uploaded file IDs,
+`video_url` can also be `{"url": "..."}` or a `data:video/mp4;base64,...` string. With the optional authenticated
+[video file store](VIDEO_FILES.md), `input_video` can instead use `file_id` for repeated questions and bounded
+visual preprocessing reuse. Without that opt-in, uploaded file IDs are rejected. Local paths,
 per-part sampling overrides, non-user video blocks, multiple videos and mixed video/image requests are rejected.
 The video route currently covers Responses only; text, image and tool requests keep their existing API paths.
 MOV/MP4, Matroska/WebM, AVI and MPEG-TS containers are accepted when FFmpeg can decode them. Playlists, changing
@@ -1599,8 +1601,9 @@ Limits are server policy. Defaults also include `max_source_bytes: 67108864`, `m
 65536 source frames, 16 Mi pixels per source frame, 1024 visual rows per pair, 65536 total visual rows and an
 1800-second preparation deadline. The RGB packet is at most 256 MiB; native embeddings are at most 671098880
 bytes. Codec processes have a 2 GiB per-process memory ceiling. Only one video request prepares or generates at a
-time; queued video requests have the same preparation deadline. Video embeddings are request-owned and are not
-cached. The directory can contain the source JSON/base64, source video, up to two RGB representations and one
+time on the URL path; queued video requests have the same preparation deadline. URL video embeddings are
+request-owned and uncached; the opt-in file store has separate bounded preprocessing and cache ownership.
+The directory can contain the source JSON/base64, source video, up to two RGB representations and one
 embedding artifact at different stages; these limits do not promise one small fixed file. Ensure adequate free
 space. Text/image traffic does not take the video slot; encoding still takes the existing inference FIFO.
 

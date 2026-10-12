@@ -60,6 +60,7 @@ from serve.frontend import (THINK_END, ChatTemplate, Event, OutputParser, anthro
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 from serve import runconfig  # noqa: E402
 from serve import video as video_api  # noqa: E402
+from serve import video_store  # noqa: E402
 from serve import logit_bias as bias_api  # noqa: E402
 from serve.winjob import contain  # noqa: E402
 from serve.structured import StructuredOutputError, prepare_format, validated_json  # noqa: E402
@@ -2047,9 +2048,11 @@ class Vision:
         self.stopped = False
 
         self.video_capable = "video=SVF2" in line.split()
+        # A new resident encoder is a new identity, even if weights were replaced in place.
+        self.video_identity = uuid.uuid4().hex
 
     def encode_video(self, packet, output, budget):
-        """No video cache: one request owns the packet and all output until handoff."""
+        """Encode one packet; the caller owns the output (and any cache publication)."""
         with video_api.acquire(self.lock, budget):
             if not self.video_capable or not self.alive():
                 raise video_api.VideoError("video requires a rebuilt strata-vision with SVF2 capability")
@@ -2893,6 +2896,8 @@ class Service:
         self.slot_save_path = None                    # --slot-save-path: /slots/0?action=save|restore (off when None)
         self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
         self.video_slot = threading.Lock()            # one bounded video preparation directory at a time
+        self.video_store = None                       # opt-in, authenticated, process-local file references
+        self.video_cache_slot = threading.Lock()       # bounds codec work independently of generation
         self.api_key = ""                              # when set, /v1/* needs it (Bearer or x-api-key)
         # #458 (opt-in, the config's "effort_position": "end"): a non-default reasoning effort goes in a short system
         # turn before the answer instead of the top of the prompt, so switching it keeps the cached conversation
@@ -3652,11 +3657,33 @@ class Service:
         visual_room = ctx - CTX_SLACK - len(ids) - (max_new if max_new and max_new > 0 and not self.fit_max_tokens else 1)
         if visual_room < 1:
             raise video_api.VideoContextError("video request exceeds the context window before video preparation")
+        if isinstance(videos[0], dict):
+            acquire_video = getattr(self.embeddings, "acquire_video", None)
+            if acquire_video is None:
+                raise video_api.VideoError("file video input requires an authenticated Responses request")
+            # Validate request fields, template markers and text capacity before any shared work.
+            self.embeddings.cached_video = acquire_video()
         with contextlib.nullcontext():                  # the handler holds video_slot through generation
             with tempfile.TemporaryDirectory(prefix="video-", dir=self.vision.dir) as directory:
-                packet = video_api.prepare(videos[0], directory, budget)
+                cached = getattr(self.embeddings, "cached_video", None)
+                if cached is None:
+                    packet = video_api.prepare(videos[0], directory, budget)
                 with video_api.acquire(self.fifo, budget):
-                    output, _, layout = self.vision.encode_video(packet, Path(directory) / "video.sve", budget)
+                    if cached is None:
+                        output, _, layout = self.vision.encode_video(packet, Path(directory) / "video.sve", budget)
+                    else:
+                        artifact, layout, identity = cached
+                        if identity != self.vision.video_identity:
+                            raise video_api.VideoError("video encoder changed; retry the request")
+                        try:
+                            video_api.validate_artifact(artifact, layout, budget.settings)
+                        except (ValueError, OSError):
+                            raise video_store.StoreError("video_cache_corrupt", "invalid cached video artifact", 503) from None
+                        output = Path(directory) / "video.sve"
+                        with Path(artifact).open("rb") as source, output.open("wb") as target:
+                            while chunk := source.read(65536):
+                                budget.check()
+                                target.write(chunk)  # cache lease stays pinned; run() owns only this copy
                     replacement = []
                     for seconds, cells in layout:
                         replacement += self.tok.encode(f"<{seconds:.17g} seconds>", parse_special=False)
@@ -3683,6 +3710,51 @@ class Service:
                         self.drop_embeddings()
                         raise
         return ids, kwargs.get("enable_thinking", True) is not False, max_new
+
+    @contextlib.contextmanager
+    def cached_video(self, owner, file_id, budget):
+        store, vision = self.video_store, self.vision
+        identity = vision.video_identity
+        settings = dict(budget.settings)
+        with store.lease(owner, file_id) as source:
+            key = store.cache_key(source.sha256, settings, json.dumps(
+                {"encoder": identity, "args": vision.spawn[0], "format": "SVF2-SVE1-layout-v1"}, sort_keys=True))
+
+            def compute(own_budget, target):
+                cancel = own_budget.cancel
+                stage, started = "queue", time.monotonic()
+                try:
+                    with video_api.acquire(self.video_cache_slot, own_budget):
+                        admitted = time.monotonic()
+                        with tempfile.TemporaryDirectory(prefix="video-cache-", dir=vision.dir) as directory:
+                            stage = "decode"
+                            packet = video_api.prepare("", directory, own_budget, local_file=source.path)
+                            decoded = time.monotonic()
+                            stage = "queue"
+                            with video_api.acquire(self.fifo, own_budget):
+                                if identity != vision.video_identity:
+                                    raise video_api.VideoError("video encoder changed; retry the request")
+                                stage = "encode"
+                                encoding = time.monotonic()
+                                output, _, layout = vision.encode_video(packet, Path(directory) / "video.sve", own_budget)
+                                encoded = time.monotonic()
+                            video_api.validate_artifact(output, layout, settings)
+                            own_budget.check()
+                            store.copy_artifact(output, target, cancel)
+                            own_budget.check()
+                            print(f"[strata] video stage=preprocess queue_s={admitted-started:.3f} "
+                                  f"decode_sampling_s={decoded-admitted:.3f} encode_queue_s={encoding-decoded:.3f} "
+                                  f"encode_s={encoded-encoding:.3f}", flush=True)
+                            return layout
+                except video_api.VideoError as e:
+                    stage = getattr(e, "stage", stage)
+                    suffix = "cancelled" if cancel.is_set() else "timeout" if time.monotonic() >= own_budget.deadline else "failed"
+                    raise video_store.StoreError(f"video_{stage}_{suffix}", f"video {stage} {suffix}: {e}", 400) from None
+
+            started = time.monotonic()
+            with store.get_or_compute(key, budget, compute, producer_context=store.retain(source)) as (artifact, layout, hit):
+                print(f"[strata] video cache={hit} wait_s={time.monotonic()-started:.3f}", flush=True)
+                yield artifact, layout, identity
 
     PREFIX_END = "\u0001strata-prefix-end\u0001"          # marks where a message's shared part ends in the rendered prompt
 
@@ -4939,7 +5011,8 @@ def make_handler(svc: Service):
             else:
                 return
             self.send_header("Access-Control-Allow-Origin", allow)
-            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS" +
+                             (", DELETE" if svc.video_store is not None else ""))
             # the headers the preflight asks for (SDKs add their own; "*" does not cover Authorization)
             asked = self.headers.get("Access-Control-Request-Headers")
             self.send_header("Access-Control-Allow-Headers",
@@ -4980,8 +5053,81 @@ def make_handler(svc: Service):
             self._json(401, {"error": {"type": "authentication_error", "message": "missing or wrong API key"}})
             return False
 
+        def _file_owner(self):
+            auth = self.headers.get("Authorization", "")
+            key = auth[7:].strip() if auth.lower().startswith("bearer ") else self.headers.get("x-api-key", "")
+            # Authentication accepts UTF-8 and Latin-1 wire forms of a configured key.
+            # Both must refer to the same owner, rather than hashing the wire spelling.
+            matches = set()
+            for candidate in key_list(svc.api_key):
+                if key_matches(key, candidate):
+                    matches.add(candidate)
+            if not matches:
+                raise video_store.StoreError("authentication_error", "missing or wrong API key", 401)
+            if len(matches) != 1:
+                raise video_store.StoreError("authentication_error", "ambiguous API key encoding for video file access", 401)
+            matched = matches.pop()
+            return hashlib.sha256(matched.encode()).hexdigest()
+
+        def _files(self, file_id=None, delete=False):
+            if svc.video_store is None:
+                return self._json(404, responses_error_body("video files are disabled", code="video_files_disabled"))
+            try:
+                owner = self._file_owner()
+                if file_id is not None:
+                    result = (svc.video_store.delete(owner, file_id) if delete else
+                              svc.video_store.status(owner, file_id))
+                else:
+                    # Raw bytes avoid multipart copies and bound memory independently of upload size.
+                    self.close_connection = True
+                    self.body_read = True  # This streaming reader owns the body, including failed uploads.
+                    if self.headers.get("Transfer-Encoding") or len(self.headers.get_all("Content-Length", [])) != 1:
+                        raise video_store.StoreError("invalid_request", "upload requires one Content-Length and no Transfer-Encoding", 400)
+                    length = self.headers.get("Content-Length", "")
+                    if not length.isascii() or not length.isdigit():
+                        raise video_store.StoreError("invalid_request", "invalid upload Content-Length", 400)
+                    if len(length) > 20:
+                        raise video_store.StoreError("video_file_too_large", "video source exceeds its byte budget", 413)
+                    mime = self.headers.get("Content-Type", "").partition(";")[0]
+                    if mime != "application/octet-stream" and not mime.startswith("video/"):
+                        raise video_store.StoreError("invalid_request", "send raw video bytes, not multipart or JSON", 415)
+                    started = time.monotonic()
+                    handler = self
+                    class UploadReader:
+                        def read(self, count):
+                            remaining = 60 - (time.monotonic() - started)
+                            if remaining <= 0:
+                                raise TimeoutError("upload deadline exceeded")
+                            handler.connection.settimeout(remaining)
+                            return handler.rfile.read1(count)
+                    old_timeout = self.connection.gettimeout()
+                    try:
+                        result = svc.video_store.create(owner, UploadReader(), int(length))
+                    finally:
+                        self.connection.settimeout(old_timeout)
+                    print(f"[strata] video stage=upload bytes={result['bytes']} elapsed_s={time.monotonic()-started:.3f}", flush=True)
+                self._json(200, result)
+            except video_store.StoreError as e:
+                self._json(e.status, responses_error_body(str(e), code=e.code))
+            except TimeoutError:
+                self._json(408, responses_error_body("video upload deadline exceeded", code="video_upload_timeout"))
+            except OSError:
+                self._json(503, responses_error_body("video upload or storage failed", code="video_upload_failed"))
+
+        def do_DELETE(self):
+            path = self.path.split("?")[0].rstrip("/")
+            if not self._authorized() or self._foreign_page():
+                return
+            if path.startswith("/v1/files/"):
+                return self._files(path[len("/v1/files/"):], delete=True)
+            self._json(404, responses_error_body("not found", code="not_found"))
+
         def do_GET(self):
             path = self.path.split("?")[0].rstrip("/")
+            if path.startswith("/v1/files/"):
+                if self._authorized():
+                    self._files(path[len("/v1/files/"):])
+                return
             if path.startswith("/fonts/"):
                 # the web app's font (Outfit, OFL: serve/web/fonts); the page falls back to the system font
                 name = path[len("/fonts/"):]
@@ -5146,6 +5292,8 @@ def make_handler(svc: Service):
             path = self.path.split("?")[0].rstrip("/")   # issue #55: Claude Code posts /v1/messages?beta=true
             if path.startswith("/v1/") and self._foreign_page():
                 return
+            if path == "/v1/files":
+                return self._files()
             if path == "/settings":
                 self._settings()
                 return
@@ -5599,6 +5747,11 @@ def make_handler(svc: Service):
             def check(text, finish):
                 return validated_json(text, validator, finish)
 
+            def generation_code(error):
+                if not getattr(self, "video_file_request", False):
+                    return "server_error"
+                return "video_generation_timeout" if isinstance(error, EngineSilent) else "video_generation_failed"
+
             def events():
                 if not getattr(self, "video_stream_started", False):
                     yield from asm.start()
@@ -5628,11 +5781,11 @@ def make_handler(svc: Service):
                                                                 code="structured_output_failed"))
                 except EngineDied as e:
                     return self._json(503, responses_error_body(f"{e}; the next request restarts it", "server_error",
-                                                                code="server_error"))
+                                                                code=generation_code(e)))
                 except EngineNonFinite as e:                 # #879, twice: not the request's fault
-                    return self._json(503, responses_error_body(str(e), "server_error", code="server_error"))
+                    return self._json(503, responses_error_body(str(e), "server_error", code=generation_code(e)))
                 except ValueError as e:                      # the engine's ERR line
-                    return self._json(500, responses_error_body(str(e), "server_error", code="server_error"))
+                    return self._json(500, responses_error_body(str(e), "server_error", code=generation_code(e)))
                 return self._json(200, result)
             if not getattr(self, "video_stream_started", False):
                 self._sse()
@@ -5661,23 +5814,33 @@ def make_handler(svc: Service):
                 cancel.set()                                 # client went away: stop the engine
                 items.close()
             except EngineDied as e:                          # mid-stream: response.failed, then the stream ends
-                self._responses_failed(asm, f"{e}; the next request restarts it", "server_error", send)
+                self._responses_failed(asm, f"{e}; the next request restarts it", generation_code(e), send)
             except StructuredOutputError as e:
                 self._responses_failed(asm, str(e), "structured_output_failed", send)
             except ValueError as e:                          # the engine's ERR after the stream started
-                self._responses_failed(asm, str(e), "server_error", send)
+                self._responses_failed(asm, str(e), generation_code(e), send)
 
         def _responses_video(self, req):
             """Prepare off the socket thread; heartbeat timing follows actual writes.
 
-            A single slot covers preparation AND generation, bounding live video
-            artifacts. Worker thread-local embeddings are explicitly handed off.
+            A single slot covers URL preparation and all video generation. File
+            preprocessing has a bounded shared producer before that slot. Worker
+            thread-local request embeddings are explicitly handed off.
             """
             try:
                 responses_api.check_request(req)
                 messages = responses_api.input_messages(req)
                 if len(videos_of(messages)) != 1 or images_of(messages):
                     raise ResponsesError("send one video per request without image parts", "input")
+                source = videos_of(messages)[0]
+                file_id = source["file_id"] if isinstance(source, dict) else None
+                self.video_file_request = file_id is not None
+                if file_id is not None:
+                    if any(m.get("role") != "user" and videos_of([m]) for m in messages):
+                        raise ResponsesError("video input is supported in user messages only", "input")
+                    if svc.video_store is None:
+                        raise ResponsesError("video files are disabled", "input", "video_files_disabled")
+                    svc.video_store.status(self._file_owner(), file_id)
                 if svc.vision is None or svc.vision.video_policy is None:
                     raise ResponsesError("video is disabled; enable vision.video.enabled", "input", "video_unavailable")
                 if getattr(svc.engine, "batch", 0):
@@ -5688,6 +5851,8 @@ def make_handler(svc: Service):
                 if not svc.vision.video_capable:
                     raise ResponsesError("rebuild strata-vision with SVF2 video support", "input", "video_unavailable")
                 tools, names, _ = responses_api.request_tools(req)
+            except video_store.StoreError as e:
+                return self._json(e.status, responses_error_body(str(e), code=e.code))
             except ResponsesError as e:
                 return self._json(e.status, e.body())
             cancel = self.video_cancel = threading.Event()
@@ -5723,21 +5888,37 @@ def make_handler(svc: Service):
                         send(asm.in_progress())
                         last = time.monotonic()
 
-                while not held:
-                    beat()
-                    held = svc.video_slot.acquire(timeout=0.1)
+                if file_id is None:
+                    while not held:
+                        beat()
+                        held = svc.video_slot.acquire(timeout=0.1)
 
                 def prepare():
+                    nonlocal held
                     svc.embeddings.video_budget = budget
                     svc.request_trace.record = self.record
                     try:
-                        box["result"] = self._responses_prepare(req)
-                        budget.check()
-                        box["path"] = getattr(svc.embeddings, "path", None)
-                        svc.embeddings.path = None
+                        with contextlib.ExitStack() as leases:
+                            def acquire_video():
+                                nonlocal held
+                                cached = getattr(svc.embeddings, "cached_video", None)
+                                if cached is None:
+                                    cached = leases.enter_context(svc.cached_video(self._file_owner(), file_id, budget))
+                                while not held:
+                                    budget.check()
+                                    held = svc.video_slot.acquire(timeout=0.1)
+                                return cached
+                            if file_id is not None:
+                                svc.embeddings.acquire_video = acquire_video
+                            box["result"] = self._responses_prepare(req)
+                            budget.check()
+                            box["path"] = getattr(svc.embeddings, "path", None)
+                            svc.embeddings.path = None
                     except Exception as e:
                         box["error"] = e
                     finally:
+                        svc.embeddings.acquire_video = None
+                        svc.embeddings.cached_video = None
                         try:
                             svc.drop_embeddings()
                         except OSError as e:
@@ -5769,11 +5950,17 @@ def make_handler(svc: Service):
                 cancel.set()
                 self._note(outcome="disconnected")
             except Exception as e:
+                if file_id is not None and isinstance(e, video_api.VideoError):
+                    code = "video_queue_timeout" if time.monotonic() >= budget.deadline else \
+                        "video_preparation_cancelled" if cancel.is_set() else "video_preparation_failed"
+                    e = video_store.StoreError(code, str(e), 408 if code.endswith("timeout") else 400)
                 cancel.set()
                 message = str(e) if isinstance(e, (ValueError, EngineDied)) else "video preparation failed"
                 if getattr(self, "video_stream_started", False):
-                    code = e.code if isinstance(e, ResponsesError) and e.code else "video_preparation_failed"
+                    code = e.code if isinstance(e, (ResponsesError, video_store.StoreError)) and e.code else "video_preparation_failed"
                     self._responses_failed(asm, message, code, send)
+                elif isinstance(e, video_store.StoreError):
+                    self._json(e.status, responses_error_body(str(e), code=e.code))
                 elif isinstance(e, ResponsesError):
                     self._json(e.status, e.body())
                 else:
@@ -5851,14 +6038,20 @@ def make_handler(svc: Service):
                 try:
                     ids, thinking, max_new = svc.prepare(messages, shown, kw, req.get("max_output_tokens") or 0, req=req)
                 except ValueError as e:
-                    if shown is tools or (isinstance(e, video_api.VideoError)
+                    if shown is tools or isinstance(e, video_store.StoreError) or (isinstance(e, video_api.VideoError)
                                           and not isinstance(e, video_api.VideoContextError)):
                         raise
                     shown = tools                            # too long with the kept tools: the request as sent
                     ids, thinking, max_new = svc.prepare(messages, shown, kw, req.get("max_output_tokens") or 0, req=req)
-            except ResponsesError:
+            except (ResponsesError, video_store.StoreError):
                 raise
             except ValueError as e:                          # too long for the context, an image without vision
+                if getattr(self, "video_file_request", False) and isinstance(e, video_api.VideoError) \
+                        and not isinstance(e, video_api.VideoContextError) and video_budget is not None:
+                    if time.monotonic() >= video_budget.deadline:
+                        raise video_store.StoreError("video_preparation_timeout", "video preparation deadline exceeded", 408) from None
+                    if video_budget.cancel.is_set():
+                        raise video_store.StoreError("video_preparation_cancelled", "video preparation cancelled", 499) from None
                 raise ResponsesError(str(e), "input", "context_length_exceeded" if "context" in str(e) else None) \
                     from None
             if svc.codex_compaction_cache:
@@ -5944,7 +6137,12 @@ class Server(ThreadingHTTPServer):
         tel = getattr(getattr(self, "svc", None), "telemetry", None)
         if tel is not None and hasattr(tel, "close"):
             tel.close()
+        store = getattr(getattr(self, "svc", None), "video_store", None)
+        if store is not None:
+            store.close()
         super().server_close()
+        if store is not None:
+            store.wait_for_producers()
 
 
 def warn_tight_ram(arena_mib) -> None:
@@ -6620,6 +6818,14 @@ def main() -> int:
     if not svc.api_key and "api_key" in cfg:             # #569: written, but empty: the server has none (a warning, not a stop)
         print("[strata] the api_key in the config is empty: this server has no API key (anyone who can reach it can "
               "use it); set one, or leave api_key out", file=sys.stderr, flush=True)
+    files_config = cfg.get("video_files")
+    if files_config is not None:
+        if not isinstance(files_config, dict) or not isinstance(files_config.get("enabled", False), bool):
+            raise SystemExit("[strata] video_files must be an object with enabled: true or false")
+        if files_config.get("enabled"):
+            if not svc.api_key or svc.vision is None or svc.vision.video_policy is None:
+                raise SystemExit("[strata] video_files requires an API key and vision.video.enabled")
+            svc.video_store = video_store.VideoStore(files_config, svc.vision.video_policy["max_source_bytes"])
     svc.cors_origins = origins_of(cfg.get("cors_origins"), "cors_origins", wildcard=True)
     svc.trusted_origins = origins_of(cfg.get("trusted_origins"), "trusted_origins", wildcard=False)
     try:
@@ -6744,7 +6950,9 @@ def main() -> int:
             time.sleep(1)                               # Windows never delivers Ctrl+C to an untimed Event.wait()
     except KeyboardInterrupt:
         print("\n[strata] stopping (Ctrl+C again to end the engine at once) ...", flush=True)
-        closers = [httpd.shutdown, getattr(engine, "close", None), vision.shutdown if vision else None,
+        closers = [httpd.shutdown, svc.video_store.close if svc.video_store is not None else None,
+                   getattr(engine, "close", None), httpd.server_close if svc.video_store is not None else None,
+                   vision.shutdown if vision else None,
                    hub.close if hub is not None else None]
         for close in filter(None, closers):
             try:
