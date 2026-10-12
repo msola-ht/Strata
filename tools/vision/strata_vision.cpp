@@ -8,8 +8,10 @@
 //                 [--max-tokens N] [--min-tokens N] [--flash-attn on|off|auto]
 // Flash attention defaults to auto, and to off on the CPU when ggml is built with AVX-512 (see main).
 //
-// Resident: prints "READY <n_embd>", then per stdin line
+// Resident: prints "READY <n_embd> video=SVF2", then per stdin line
 //   ENC <image path> <output path>   ->  "OK <n_tokens> <nx> <ny> <ms>"  or  "ERR <message>"
+//   ENCV2 <max_total_tokens> <packet path> <output path>
+//                                  ->  "OK <n_tokens> <n_pairs> <n_frames> <ms>" then "LAYOUT <layout>"
 //   QUIT
 // The output file is  int32 {0x31455653 'SVE1', n_tokens, nx, ny, n_embd}  then float32 [n_tokens][n_embd],
 // row i at grid position (x = i % nx, y = i / nx).  The text model is opened vocab-only (no weights).
@@ -25,10 +27,17 @@
 #include <unistd.h>
 #endif
 #include <chrono>
+#include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <iostream>
+#include <iomanip>
+#include <limits>
+#include <locale>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -50,6 +59,236 @@ bool parse_enc(const std::string& line, std::string& img, std::string& out) {
     img = rest.substr(0, sp);
     out = rest.substr(sp + 1);
     return !img.empty() && !out.empty();
+}
+
+// SVF2 is prepared by the server from decoded frames and their source timestamps. All integers and doubles are
+// little endian: magic, uint32 width/height/frame count, then (float64 seconds, RGB24 pixels) for each frame.
+// Only one pair is held at a time. Consecutive mergeable bitmaps form one temporal patch; the final odd frame is
+// copied. LAYOUT carries S<seconds>;I<rows> for each pair. Text is tokenized by the serving tokenizer, not here.
+constexpr uint64_t kVideoPacketBytes = 256ULL << 20;
+constexpr int kVideoMaxTokens = 65536;
+constexpr int kVideoMaxFrameTokens = 1024;
+constexpr int kVideoMaxFrames = 1024;
+constexpr int kVideoEmbeddingWidth = 2560;
+constexpr uint64_t kVideoOutputBytes = uint64_t(kVideoMaxTokens) * kVideoEmbeddingWidth * sizeof(float) +
+                                        uint64_t(kVideoMaxFrames / 2) * 5 * sizeof(int32_t);
+
+struct Encv2Args {
+    int max_total_tokens = 0;
+    std::string packet, out;
+};
+
+bool parse_encv2(const std::string& line, Encv2Args& a) {
+    if (line.rfind("ENCV2 ", 0) != 0 || line.find('\0') != std::string::npos) return false;
+    std::istringstream is(line.substr(6));
+    if (!(is >> a.max_total_tokens) || a.max_total_tokens <= 0 || a.max_total_tokens > kVideoMaxTokens)
+        return false;
+    if (is.peek() != ' ' && is.peek() != '\t') return false;
+    std::string rest;
+    std::getline(is, rest);
+    const size_t first = rest.find_first_not_of(" \t");
+    if (first == std::string::npos) return false;
+    return parse_enc("ENC " + rest.substr(first), a.packet, a.out);
+}
+
+using FilePtr = std::unique_ptr<FILE, int (*)(FILE*)>;
+using BitmapPtr = std::unique_ptr<mtmd_bitmap, decltype(&mtmd_bitmap_free)>;
+using ChunksPtr = std::unique_ptr<mtmd_input_chunks, decltype(&mtmd_input_chunks_free)>;
+
+struct VideoOutput {
+    std::string path;
+    FILE* file = nullptr;
+    bool committed = false;
+    explicit VideoOutput(const std::string& p) : path(p) {}
+    ~VideoOutput() {
+        if (file) std::fclose(file);
+        if (!committed && created) std::remove(path.c_str());
+    }
+    bool created = false;
+    bool open() {
+        // Exclusive creation also rejects a packet/output alias, preserving both existing files and input data.
+        file = std::fopen(path.c_str(), "wbx");
+        created = file != nullptr;
+        return created;
+    }
+    bool finish() {
+        FILE* closing = file;
+        file = nullptr;
+        if (std::fclose(closing) != 0) return false;
+        committed = true;
+        return true;
+    }
+};
+
+uint32_t read_le_u32(const unsigned char* p) {
+    return uint32_t(p[0]) | (uint32_t(p[1]) << 8) | (uint32_t(p[2]) << 16) | (uint32_t(p[3]) << 24);
+}
+
+bool read_timestamp(FILE* f, double& value) {
+    static_assert(sizeof(double) == 8 && std::numeric_limits<double>::is_iec559, "SVF2 needs IEEE float64");
+    unsigned char bytes[8];
+    if (std::fread(bytes, 1, sizeof bytes, f) != sizeof bytes) return false;
+    uint64_t bits = 0;
+    for (size_t i = 0; i < sizeof bytes; ++i) bits |= uint64_t(bytes[i]) << (8 * i);
+    std::memcpy(&value, &bits, sizeof value);
+    return true;
+}
+
+// A pair must map exactly onto the engine's existing 2-D SVE1 positions. Inspect every row before encoding or
+// writing, rather than accepting a rectangular last position while earlier rows use temporal or other positions.
+std::string write_video_record(mtmd_context* ctx, const mtmd_input_chunk* ch, int n_embd, FILE* f,
+                               int row_room, uint64_t byte_room, int& n) {
+    const size_t rows = mtmd_input_chunk_get_n_tokens(ch);
+    if (rows == 0 || rows > size_t(kVideoMaxFrameTokens) || rows > size_t(row_room))
+        return "the video exceeds its image token budget";
+    const mtmd_image_tokens* it = mtmd_input_chunk_get_tokens_image(ch);
+    if (!it) return "the video has no image tokens";
+    const mtmd_decoder_pos last = mtmd_image_tokens_get_decoder_pos(it, 0, rows - 1);
+    if (last.x >= kVideoMaxFrameTokens || last.y >= kVideoMaxFrameTokens)
+        return "the video has invalid image positions";
+    const int nx = int(last.x) + 1, ny = int(last.y) + 1;
+    if (uint64_t(nx) * ny != rows) return "the video image grid is not rectangular";
+    if (mtmd_input_chunk_get_n_pos(ch) != std::max(nx, ny))
+        return "the video position span cannot be represented by SVE1";
+    for (size_t i = 0; i < rows; ++i) {
+        const mtmd_decoder_pos pos = mtmd_image_tokens_get_decoder_pos(it, 0, i);
+        if (pos.t != 0 || pos.z != 0 || pos.x != i % nx || pos.y != i / nx)
+            return "the video image positions cannot be represented by SVE1";
+    }
+    const uint64_t bytes = 5 * sizeof(int32_t) + uint64_t(rows) * n_embd * sizeof(float);
+    if (bytes > byte_room) return "the video exceeds its output byte budget";
+    if (mtmd_encode_chunk(ctx, ch) != 0) return "the vision encoder failed";
+    const float* embd = mtmd_get_output_embd(ctx);
+    if (!embd) return "the vision encoder returned no embeddings";
+    n = int(rows);
+    const int32_t hdr[5] = {0x31455653, n, nx, ny, n_embd};
+    if (std::fwrite(hdr, sizeof hdr, 1, f) != 1 ||
+        std::fwrite(embd, sizeof(float) * size_t(n_embd), rows, f) != rows)
+        return "short write to the video output";
+    return "";
+}
+
+std::string encode_video_packet(mtmd_context* ctx, int n_embd, const Encv2Args& a,
+                                int& total, int& pairs, int& frame_count, std::string& layout) {
+    if (n_embd != kVideoEmbeddingWidth) return "the video projector must have 2560 embedding columns";
+    FilePtr input(std::fopen(a.packet.c_str(), "rb"), &std::fclose);
+    if (!input) return "cannot read the video packet";
+    if (std::fseek(input.get(), 0, SEEK_END) != 0) return "cannot measure the video packet";
+    const long file_bytes = std::ftell(input.get());
+    if (file_bytes < 16 || uint64_t(file_bytes) > kVideoPacketBytes)
+        return "the video packet size is outside its limit";
+    if (std::fseek(input.get(), 0, SEEK_SET) != 0) return "cannot rewind the video packet";
+    unsigned char header[16];
+    if (std::fread(header, 1, sizeof header, input.get()) != sizeof header ||
+        std::memcmp(header, "SVF2", 4) != 0) return "invalid SVF2 video packet header";
+    const uint32_t width = read_le_u32(header + 4), height = read_le_u32(header + 8);
+    const uint32_t frames = read_le_u32(header + 12);
+    if (width == 0 || height == 0 || width % 32 != 0 || height % 32 != 0 ||
+        uint64_t(width) * height / 1024 > kVideoMaxFrameTokens || frames == 0 || frames > kVideoMaxFrames)
+        return "invalid SVF2 dimensions or frame count";
+    const uint64_t rgb_bytes = uint64_t(width) * height * 3;
+    const uint64_t expected_bytes = sizeof header + uint64_t(frames) * (8 + rgb_bytes);
+    if (expected_bytes != uint64_t(file_bytes)) return "the SVF2 video packet length does not match its header";
+    const int expected_pairs = int((frames + 1) / 2);
+    const uint64_t predicted_rows = uint64_t(expected_pairs) * (uint64_t(width) * height / 1024);
+    if (predicted_rows > uint64_t(a.max_total_tokens)) return "the video exceeds its image token budget";
+    std::vector<double> timestamps(frames);
+    for (uint32_t i = 0; i < frames; ++i) {
+        if (!read_timestamp(input.get(), timestamps[i]) || !std::isfinite(timestamps[i]) || timestamps[i] < 0 ||
+            (i != 0 && timestamps[i] <= timestamps[i - 1]))
+            return "SVF2 timestamps must be finite, nonnegative and strictly increasing";
+        if (std::fseek(input.get(), long(rgb_bytes), SEEK_CUR) != 0) return "cannot read the video packet frames";
+    }
+    if (std::fseek(input.get(), sizeof header, SEEK_SET) != 0) return "cannot rewind the video packet frames";
+    VideoOutput output(a.out);
+    if (!output.open()) return "cannot exclusively create the video output";
+    std::vector<unsigned char> rgb(size_t(rgb_bytes), 0);
+    const std::string marker = mtmd_default_marker();
+    uint64_t output_bytes = 0;
+    for (uint32_t base = 0; base < frames; base += 2) {
+        BitmapPtr first(nullptr, &mtmd_bitmap_free), second(nullptr, &mtmd_bitmap_free);
+        const uint32_t count = std::min(uint32_t(2), frames - base);
+        for (uint32_t j = 0; j < count; ++j) {
+            double timestamp = 0;
+            if (!read_timestamp(input.get(), timestamp) || timestamp != timestamps[base + j] ||
+                std::fread(rgb.data(), 1, rgb.size(), input.get()) != rgb.size())
+                return "the video packet changed or ended while reading frames";
+            BitmapPtr bm(mtmd_bitmap_init(width, height, rgb.data()), &mtmd_bitmap_free);
+            if (!bm) return "cannot allocate a video frame";
+            mtmd_bitmap_set_mergeable(bm.get(), true);
+            if (j == 0) first = std::move(bm);
+            else second = std::move(bm);
+        }
+        if (count == 1) {
+            second.reset(mtmd_bitmap_init(width, height, rgb.data()));
+            if (!second) return "cannot duplicate the final video frame";
+            mtmd_bitmap_set_mergeable(second.get(), true);
+        }
+        const double pair_time = timestamps[base] + (timestamps[base + count - 1] - timestamps[base]) / 2;
+        std::ostringstream label;
+        label.imbue(std::locale::classic());
+        label << std::setprecision(17) << pair_time;
+        const std::string prompt = '<' + label.str() + " seconds>" + marker + marker;
+        const mtmd_bitmap* bitmaps[2] = {first.get(), second.get()};
+        ChunksPtr chunks(mtmd_input_chunks_init(), &mtmd_input_chunks_free);
+        if (!chunks) return "cannot allocate video chunks";
+        mtmd_input_text txt{prompt.c_str(), prompt.size(), false, true};
+        if (mtmd_tokenize(ctx, chunks.get(), &txt, bitmaps, 2) != 0)
+            return "the video pair could not be preprocessed";
+        size_t image_chunks = 0;
+        for (size_t c = 0; c < mtmd_input_chunks_size(chunks.get()); ++c) {
+            const mtmd_input_chunk* ch = mtmd_input_chunks_get(chunks.get(), c);
+            const auto type = mtmd_input_chunk_get_type(ch);
+            if (type == MTMD_INPUT_CHUNK_TYPE_IMAGE) ++image_chunks;
+            else if (type != MTMD_INPUT_CHUNK_TYPE_TEXT) return "the video gave an unsupported chunk type";
+        }
+        if (image_chunks != 1) return "the video pair did not merge into exactly one image chunk";
+        for (size_t c = 0; c < mtmd_input_chunks_size(chunks.get()); ++c) {
+            const mtmd_input_chunk* ch = mtmd_input_chunks_get(chunks.get(), c);
+            if (mtmd_input_chunk_get_type(ch) == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
+                int n = 0;
+                const std::string err = write_video_record(ctx, ch, n_embd, output.file,
+                                                           a.max_total_tokens - total,
+                                                           kVideoOutputBytes - output_bytes, n);
+                if (!err.empty()) return err;
+                if (!layout.empty()) layout += ';';
+                layout += 'S' + label.str() + ";I" + std::to_string(n);
+                total += n;
+                output_bytes += 5 * sizeof(int32_t) + uint64_t(n) * n_embd * sizeof(float);
+                ++pairs;
+            }
+        }
+    }
+    if (std::fgetc(input.get()) != EOF || std::ferror(input.get())) return "the video packet changed after validation";
+    if (pairs != expected_pairs || total <= 0 || total > a.max_total_tokens)
+        return "the video output does not match its frame count or token budget";
+    if (!output.finish()) return "cannot finish writing the video output";
+    frame_count = int(frames);
+    return "";
+}
+
+bool video_projector_profile(const gguf_context* gg, int n_embd) {
+    if (!gg || n_embd != kVideoEmbeddingWidth) return false;
+    // Match mtmd's explicit projector metadata, including its mixed-modality fallback. A plain 2560-column
+    // projector does not establish temporal merging. Deepstack output has additional columns SVE1 cannot carry.
+    int64_t type_key = gguf_find_key(gg, "clip.projector_type");
+    const char* type = nullptr;
+    if (type_key >= 0 && gguf_get_kv_type(gg, type_key) == GGUF_TYPE_STRING)
+        type = gguf_get_val_str(gg, type_key);
+    if (!type || !*type) {
+        type_key = gguf_find_key(gg, "clip.vision.projector_type");
+        if (type_key >= 0 && gguf_get_kv_type(gg, type_key) == GGUF_TYPE_STRING)
+            type = gguf_get_val_str(gg, type_key);
+    }
+    if (!type || std::strcmp(type, "qwen3vl_merger") != 0) return false;
+    const int64_t patch = gguf_find_key(gg, "clip.vision.patch_size");
+    if (patch < 0 || gguf_get_kv_type(gg, patch) != GGUF_TYPE_UINT32 || gguf_get_val_u32(gg, patch) != 16)
+        return false;
+    for (int64_t i = 0; i < gguf_get_n_tensors(gg); ++i) {
+        const char* name = gguf_get_tensor_name(gg, i);
+        if (name && std::strncmp(name, "v.deepstack.", 12) == 0) return false;
+    }
+    return true;
 }
 
 }  // namespace
@@ -143,11 +382,13 @@ int main(int argc, char** argv) {
                  std::chrono::duration<double>(std::chrono::steady_clock::now() - load_t0).count());
     // a vocab-only model reports no hparams, so the width comes from the projector: its output is the model's input
     int n_embd = 0;
+    bool video_profile = false;
     {
         gguf_init_params gp{true, nullptr};
         gguf_context* gg = gguf_init_from_file(mmproj.c_str(), gp);
         const int64_t k = gg ? gguf_find_key(gg, "clip.vision.projection_dim") : -1;
         if (k >= 0) n_embd = (int) gguf_get_val_u32(gg, k);
+        video_profile = video_projector_profile(gg, n_embd);
         if (gg) gguf_free(gg);
     }
     if (n_embd <= 0) { std::printf("ERR the vision encoder has no projection_dim\n"); std::fflush(stdout); return 1; }
@@ -180,13 +421,39 @@ int main(int argc, char** argv) {
         mtmd_input_chunks_free(chunks);
         if (bm) mtmd_bitmap_free(bm);
     }
-    std::printf("READY %d\n", n_embd);
+    std::printf("READY %d%s\n", n_embd, video_profile ? " video=SVF2" : "");
     std::fflush(stdout);
 
     std::string line;
     while (std::getline(std::cin, line)) {
         while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.pop_back();
         if (line == "QUIT") break;
+        if (line.rfind("ENCV2", 0) == 0) {
+            Encv2Args va;
+            if (!parse_encv2(line, va)) {
+                std::printf("ERR expected: ENCV2 <max_total_tokens> <packet> <output>\n");
+                std::fflush(stdout);
+                continue;
+            }
+            if (!video_profile) {
+                std::printf("ERR the projector does not support the SVF2 video profile\n");
+                std::fflush(stdout);
+                continue;
+            }
+            const auto t0 = std::chrono::steady_clock::now();
+            int total = 0, pairs = 0, frames = 0;
+            std::string err, layout;
+            try {
+                err = encode_video_packet(ctx, n_embd, va, total, pairs, frames, layout);
+            } catch (const std::exception& e) {
+                err = std::string("cannot encode the video packet: ") + e.what();
+            }
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            if (err.empty()) std::printf("OK %d %d %d %.0f\nLAYOUT %s\n", total, pairs, frames, ms, layout.c_str());
+            else std::printf("ERR %s\n", err.c_str());
+            std::fflush(stdout);
+            continue;
+        }
         std::string img, out;
         if (!parse_enc(line, img, out)) { std::printf("ERR expected: ENC <image> <output>\n"); std::fflush(stdout); continue; }
         const auto t0 = std::chrono::steady_clock::now();

@@ -1215,7 +1215,7 @@ more than 16 MiB apart. A symbolic link, a second hard link and a file with one 
 
 **Current limits (v1):** one request at a time unless `"parallel": N` is set (opt-in batch slots, up to N requests
 decoded together: [BATCHING.md](BATCHING.md)), and one conversation cached at a time (switching between two chats
-re-reads the other one unless the opt-in cache above is enabled, or each conversation keeps its own batch slot); images only when set up with them (below); no video. **Temperature / top_p / top_k / min_p /
+re-reads the other one unless the opt-in cache above is enabled, or each conversation keeps its own batch slot); images only when set up with them (below); finite video is opt-in on Responses (below). **Temperature / top_p / top_k / min_p /
 seed** are honored per request (OpenAI and Anthropic fields), and so are stop strings (OpenAI `stop`, a string or up
 to 4; Anthropic `stop_sequences`): the answer ends before the first one, which is not sent, and the engine stops
 there (`finish_reason` "stop"; `stop_reason` "stop_sequence" with `stop_sequence` set to the one found); with the default adaptive expert tier a sampled result
@@ -1502,6 +1502,126 @@ print(r.choices[0].message.content)
 
 JPEG, PNG, BMP, GIF, WebP, TIFF and AVIF work (the last ones are converted to PNG first; agents such as omp send
 WebP). Chat apps with image upload work the same way.
+
+### Finite video input on Responses (opt-in)
+
+`POST /v1/responses` accepts one video in a user message. This implementation reuses the paired-frame encoding
+and SVE1 layout approach from upstream PR #1609; it does not merge PR #1327. The decoder reads actual frame
+presentation timestamps instead of estimating them from an output frame number. At a fixed sampling grid it picks
+the nearest source frame (earlier frame on a tie), removes duplicate picks and also keeps the final frame. Adjacent
+selected frames form one temporal patch; an odd final frame is duplicated. Each pair's actual mean timestamp is
+text before its visual embeddings. The serving tokenizer encodes that text and its vision markers; token IDs from
+the encoder's separately configured text model are never copied into the prompt. This is not a sequence of
+independently encoded still images.
+
+Video is off unless the existing `vision` config contains this entry:
+
+```json
+"video": {
+  "enabled": true,
+  "fps": 2,
+  "max_duration_s": 120,
+  "max_frames": 256,
+  "pair_tokens": 256,
+  "max_tokens": 32768,
+  "deadline_s": 600,
+  "ffmpeg": "ffmpeg",
+  "ffprobe": "ffprobe"
+}
+```
+
+Install FFmpeg and FFprobe on the serving host, or set their executable paths above. Rebuild `strata-vision` using
+the same pinned llama.cpp revision as the current engine (`3cf03257f219afbe7334045ff7c6a06ac68c627d`):
+
+On Windows, run `./BUILD-VIDEO.ps1` in PowerShell (`-Cpu` for CPU encoding, `-Jobs 4` to limit build parallelism).
+The script loads the Visual Studio 2022 x64 developer environment, checks MSVC and Windows SDK tools, checks CUDA
+for GPU builds, obtains the pinned dependency and builds the encoder. Install the C++ desktop workload, Windows
+SDK, Git, CMake, Ninja and, for GPU builds, CUDA Toolkit first. It reuses `third_party/llama-video` when present;
+otherwise the dependency goes under the ignored build directory. `-LlamaDir` selects another checkout, whose
+commit and tracked changes are checked without resetting it. `-VsPath` selects another compatible Visual Studio
+installation. Do not run it concurrently with another build in the same output directory. A failed configure or
+build stops the script. It does not install tools, edit model settings, replace the running encoder or restart
+Strata. Point `vision.exe` at the printed output path after a successful build. Windows execution still requires
+validation on a Windows host.
+
+To update the current tracked branch and build the GPU video encoder together, close the running Strata service
+and run `./UPDATE.bat --video`. This mode accepts no additional arguments. It runs `git pull --ff-only`, the usual
+installer update, then the video build; a failed step stops the command with a nonzero exit code. It stops before
+updating if tracked files have local changes; it does not stash or discard them. It never uses
+the ordinary updater's legacy fallback that moves old Git history to `origin/main`. Set the video branch's
+tracking remote first (for example `fork/codex-responses-video`). The installer may update Python packages, the
+prebuilt engine and model settings as usual; its intermediate "updated" message does not mean the video build
+has succeeded. The final build message prints the encoder path, which you must select in `vision.exe`, and video
+must still be enabled explicitly. Plain `UPDATE.bat` keeps the existing update behavior. For CPU encoding or
+custom build options, use `./BUILD-VIDEO.ps1 -Update -Cpu` or `-Update` with the required build options; this uses
+the same protected Git update path.
+
+For a manual build:
+
+```sh
+cmake -S tools/vision -B build-vision -G Ninja -DCMAKE_BUILD_TYPE=Release -DLLAMA_DIR=/path/to/llama.cpp
+cmake --build build-vision --target strata-vision
+```
+
+That command builds a CPU encoder. For an existing CUDA vision deployment, add `-DSTRATA_VISION_CUDA=ON` and the
+appropriate `CMAKE_CUDA_ARCHITECTURES` at configure time. Point `vision.exe` at the rebuilt executable. Deployment
+and restarting the serving host are separate steps: do not replace an in-use executable. Load the model and vision
+encoder before sending video; video requests do not perform lazy model loading. Engine batching (including replica
+dispatch through batch slots) is not supported for video: it does not hold the inference FIFO while generating.
+With video enabled, `/health` includes `videos: true` only when the model is loaded without batching, the running
+encoder advertises the supported profile and both codec executables are found. An older encoder continues to
+handle images but video is refused.
+
+Example request body (use the deployment's API key in the Authorization header):
+
+```json
+{
+  "model": "qwen3.8-flash-next-iq3_s",
+  "stream": true,
+  "max_output_tokens": 512,
+  "input": [{"role": "user", "content": [
+    {"type": "input_text", "text": "Describe the events in order, with timestamps."},
+    {"type": "input_video", "video_url": "https://your-host.example/clip.mp4"}
+  ]}]
+}
+```
+
+`video_url` can also be `{"url": "..."}` or a `data:video/mp4;base64,...` string. Local paths, uploaded file IDs,
+per-part sampling overrides, non-user video blocks, multiple videos and mixed video/image requests are rejected.
+The video route currently covers Responses only; text, image and tool requests keep their existing API paths.
+MOV/MP4, Matroska/WebM, AVI and MPEG-TS containers are accepted when FFmpeg can decode them. Playlists, changing
+resolution, non-monotonic/missing frame timestamps, non-square pixels and rotated video metadata are rejected;
+normalize pixel aspect ratio and rotation before upload. Audio is ignored. Downloads with an advertised
+Content-Length must contain exactly that many bytes.
+
+Limits are server policy. Defaults also include `max_source_bytes: 67108864`, `max_source_frames: 32768` and
+`max_source_pixels: 16777216`. Hard ceilings are 24 FPS, 600 seconds, 1024 selected frames, 256 MiB source,
+65536 source frames, 16 Mi pixels per source frame, 1024 visual rows per pair, 65536 total visual rows and an
+1800-second preparation deadline. The RGB packet is at most 256 MiB; native embeddings are at most 671098880
+bytes. Codec processes have a 2 GiB per-process memory ceiling. Only one video request prepares or generates at a
+time; queued video requests have the same preparation deadline. Video embeddings are request-owned and are not
+cached. The directory can contain the source JSON/base64, source video, up to two RGB representations and one
+embedding artifact at different stages; these limits do not promise one small fixed file. Ensure adequate free
+space. Text/image traffic does not take the video slot; encoding still takes the existing inference FIFO.
+
+Exceeding a limit returns an error rather than silently shortening the clip or lowering FPS. `pair_tokens` caps
+the decoded frame grid; the resident encoder's image min/max settings can resize that grid again, and actual
+visual rows are checked against the native limits. The complete prompt, including timestamp text, must fit the
+model context with the requested answer budget. A text prompt that already leaves no room for video is rejected
+before downloading or decoding. An encoder's complete rejection preserves the resident process; an interrupted or
+malformed exchange stops it so a later request cannot consume a stale reply.
+
+Streamed video requests emit `response.created`, `response.in_progress`, and another `response.in_progress` every
+10 seconds during queuing/download/probe/decode/encode. These are real SSE events, not only comments. After headers
+are sent, preparation errors use `response.failed`; before streaming they use the usual Responses error object.
+Context overflow keeps the `context_length_exceeded` error code in either response mode.
+Client disconnect and the preparation deadline stop the worker process tree and an in-flight encoder exchange,
+then delete request files. A cancelled encoder is restarted by the existing image/text load path before another
+video is accepted. Generation retains the engine's existing cancellation and generation timeout settings.
+
+Build/runtime evidence for this branch must be reported separately from upstream authors' measurements. This
+implementation does not establish video answer accuracy or temporal grounding on any GPU. CUDA, HIP, SYCL and
+Windows require validation on those platforms before deployment there.
 
 ### Speed with images on (4K context, measured)
 

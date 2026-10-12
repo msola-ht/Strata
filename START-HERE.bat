@@ -38,8 +38,9 @@ exit /b 1
 
 :run
 ".venv\Scripts\python.exe" setup.py %*
-if errorlevel 1 pause
-exit /b
+set "STRATA_SETUP_EXIT=%ERRORLEVEL%"
+if not "%STRATA_SETUP_EXIT%"=="0" pause
+exit /b %STRATA_SETUP_EXIT%
 
 :findpy
 rem the py launcher first, then python on PATH (not the Microsoft Store stub), then the usual per-user folders
