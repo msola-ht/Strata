@@ -8,6 +8,9 @@
 # here. The patch branches are rewritten (rebase), so they are pushed with --force-with-lease; dev is merged
 # instead, so the pull requests that land in dev keep a base that never moves under them. Everything is pushed
 # with the workflow's own token, and a push with that token starts no workflow: this cannot loop.
+#
+# dev is this fork's own branch: the fork's own commits live there and reach main only as patch branches that
+# were asked for by hand. PATCH_BRANCHES is empty until one of those exists again.
 name: sync-upstream
 
 on:
@@ -29,7 +32,7 @@ concurrency:
 
 env:
   UPSTREAM: https://github.com/Niko1221/Strata.git
-  PATCH_BRANCHES: codex-tool-search       # the branches carrying this fork's own commits
+  PATCH_BRANCHES: ""                      # no patch branch for now: dev carries the fork's own commits
 
 jobs:
   sync-main:
