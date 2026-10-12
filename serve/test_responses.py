@@ -127,6 +127,47 @@ class Parsing(unittest.TestCase):
         self.assertEqual([t["name"] for t in tools], ["exec_command", "later_tool"])
         self.assertIn("later_tool", names)
 
+    def test_codex_client_tool_search_is_declared_and_its_items_are_read(self):
+        """#1917: Codex's client-side tool discovery; the client runs the search, the model only calls it."""
+        decl = {"type": "tool_search", "execution": "client", "description": "Finds tools."}
+        found = {"type": "function", "name": "found_tool", "parameters": {"type": "object"}}
+        tools, names, skipped = request_tools({"tools": [*TOOLS, decl, decl,
+                                                         {"type": "tool_search", "execution": "server"}]})
+        self.assertEqual([t["name"] for t in tools], ["exec_command", "tool_search"])
+        self.assertEqual(names["tool_search"], (None, "tool_search", "tool_search"))
+        self.assertEqual(skipped, ["tool_search"])          # the server-side one is a hosted tool, left out
+        req = {"tools": [decl], "input": [
+            {"type": "message", "role": "user", "content": "find a tool"},
+            {"type": "tool_search_call", "call_id": "c1", "arguments": {"query": "search"}},
+            {"type": "tool_search_output", "execution": "client", "call_id": "c1",
+             "tools": [found, {"type": "namespace", "name": "mcp_fs",
+                               "tools": [{"type": "function", "name": "read"}]}]}]}
+        messages = input_messages(req)
+        self.assertEqual([m["role"] for m in messages], ["user", "assistant", "tool"])
+        self.assertEqual(messages[1]["tool_calls"][0]["function"],
+                         {"name": "tool_search", "arguments": {"query": "search"}})
+        self.assertEqual(json.loads(messages[2]["content"]), [found, {"type": "namespace", "name": "mcp_fs",
+                                                                      "tools": [{"type": "function",
+                                                                                 "name": "read"}]}])
+        # the search's own tools are declared too, or the model could not call them (as for #782)
+        self.assertEqual([t["name"] for t in request_tools(req)[0]], ["tool_search", "found_tool", "mcp_fs.read"])
+
+    def test_a_tool_search_never_refuses_the_request(self):
+        """#1917: the shapes a client may send keep working; only the structural errors are still refused."""
+        decl = {"type": "tool_search", "execution": "client"}
+        both = {"tools": [decl], "input": [{"type": "additional_tools", "tools": [dict(decl)]}]}
+        self.assertEqual([t["name"] for t in request_tools(both)[0]], ["tool_search"])   # declared once
+        named = {"type": "function", "name": "tool_search", "parameters": {"type": "object"}}
+        tools, names, _ = request_tools({"tools": [named, dict(decl)]})
+        self.assertEqual([(t["name"], names[t["name"]][2]) for t in tools],
+                         [("tool_search", "function")])          # the client's own function keeps the name
+        self.assertEqual([t["name"] for t in request_tools({"tools": [{"type": "tool_search",
+                                                                       "name": "my_search"}]})[0]],
+                         ["tool_search"])                        # Codex's name, whatever the client called it
+        for tool in ({"name": "x"}, {"type": "function"}):
+            with self.assertRaises(ResponsesError):
+                request_tools({"tools": [tool]})
+
     def test_effort_and_text_format(self):
         self.assertEqual(template_kwargs({"reasoning": {"effort": "minimal"}}, {}), {"enable_thinking": False})
         self.assertEqual(template_kwargs({"reasoning": {"effort": "high"}}, {}), {"reasoning_effort": "xhigh"})
@@ -643,6 +684,47 @@ class ThreadTitle(Server):
         self.assertEqual(code, 200, r)
         self.assertTrue(self.engine.last_prompt)                  # it ran on the engine
         self.assertNotIn('"title"', json.dumps(r["output"]))
+
+
+class CodexToolSearch(Server):
+    """#1917: Codex's client-side tool search through /v1/responses."""
+
+    def test_the_model_calls_tool_search_as_codex_does(self):
+        self.engine.scripts = [self.tok.encode(
+            "</think>\n\n<tool_call>\n<function=tool_search>\n<parameter=query>\nweb search\n</parameter>\n"
+            "</function>\n</tool_call><|im_end|>", parse_special=True)]
+        self.engine.script = self.engine.scripts[0]
+        decl = {"type": "tool_search", "execution": "client", "description": "Finds tools.",
+                "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}}
+        code, events = self.post({"model": "m", "input": "find a tool", "tools": [decl], "stream": True})
+        self.assertEqual(code, 200, events)
+        self.assertIn("tool_search", self.tok.decode(self.engine.last_prompt))
+        added, done = [e["item"] for e in events if e["type"].startswith("response.output_item.")]
+        self.assertEqual((added["type"], added["status"], added["arguments"]),
+                         ("tool_search_call", "in_progress", {}))
+        self.assertNotIn("name", done)                              # Codex's own item carries no name
+        self.assertEqual((done["type"], done["status"], done["execution"], done["arguments"]),
+                         ("tool_search_call", "completed", "client", {"query": "web search"}))
+        self.assertEqual([e["type"] for e in events if "arguments" in e["type"]], [])   # no argument deltas
+        self.assertEqual(events[-1]["type"], "response.completed")
+
+    def test_a_search_result_the_client_sends_back_can_be_called(self):
+        self.engine.scripts = [self.tok.encode(
+            "</think>\n\n<tool_call>\n<function=found_tool>\n<parameter=value>\n7\n</parameter>\n</function>\n"
+            "</tool_call><|im_end|>", parse_special=True)]
+        self.engine.script = self.engine.scripts[0]
+        decl = {"type": "tool_search", "execution": "client", "description": "Finds tools."}
+        found = {"type": "function", "name": "found_tool", "description": "Returns a number.",
+                 "parameters": {"type": "object", "properties": {"value": {"type": "integer"}}}}
+        code, r = self.post({"model": "m", "tools": [decl], "input": [
+            {"type": "message", "role": "user", "content": "find a tool"},
+            {"type": "tool_search_call", "call_id": "c1", "execution": "client", "arguments": {"query": "number"}},
+            {"type": "tool_search_output", "call_id": "c1", "execution": "client", "tools": [found]},
+            {"type": "message", "role": "user", "content": "use it"}]})
+        self.assertEqual(code, 200, r)
+        call, = r["output"]
+        self.assertEqual((call["type"], call["name"], json.loads(call["arguments"])),
+                         ("function_call", "found_tool", {"value": 7}))
 
 
 class CodexCompactionOverHttp(Server):
