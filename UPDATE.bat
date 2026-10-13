@@ -6,6 +6,18 @@ rem START-HERE.bat. Options are passed on to setup.py.
 setlocal
 title Strata - update
 cd /d "%~dp0"
+rem This fork's own changes live on the dev branch (main is the upstream mirror): a clone on another branch would
+rem update upstream's code and, with --video, build against the wrong tree. Say so instead of touching it.
+if exist ".git" (
+  git rev-parse --abbrev-ref HEAD 2>nul | findstr /x /i "dev" >nul || (
+    git show-ref --verify --quiet refs/remotes/origin/dev && (
+      echo  This is the video fork: its own changes live on the dev branch, and this clone is on another one.
+      echo  Nothing was updated. Switch first, then run UPDATE.bat again:
+      echo    git switch dev
+      exit /b 1
+    )
+  )
+)
 rem Video updates deliberately avoid the legacy history-reset fallback below.
 rem This mode accepts no setup options; use BUILD-VIDEO.ps1 directly for build options.
 if /i "%~1"=="--video" (
@@ -81,7 +93,7 @@ rem All of it in one block: cmd reads a .bat file while it runs it, and the git 
     )
   ) else (
     echo  This copy of Strata was not made with git, so it cannot fetch new files itself. Download the newest one:
-    echo    https://github.com/Niko1221/Strata/archive/refs/heads/main.zip
+    echo    https://github.com/msola-ht/Strata/archive/refs/heads/dev.zip
     echo  unzip it anywhere and run START-HERE.bat ^(or UPDATE.bat^) in it: it finds the model files in Strata-data
     echo  and sets itself up the same way - nothing big is downloaded again.
     echo  Checking this copy's engine and settings meanwhile ...
