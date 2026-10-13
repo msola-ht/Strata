@@ -209,6 +209,10 @@ def focused_recovery_prompt(tok, ids, generated):
 
 
 LOOPBACK_NAMES = ("localhost", "127.0.0.1", "::1")
+# This fork's own defaults (upstream: 127.0.0.1 with no key): the server listens beyond this PC unless the config
+# or --host says otherwise, so it gets a placeholder key that the printed line says where to change.
+DEFAULT_HOST = "0.0.0.0"
+DEFAULT_API_KEY = "sk-123456"
 QUEUE_BEAT_S = 10.0         # a request waiting for the single turn sends a keep-alive this often (#1619)
 KEEPALIVE_S = 10.0          # a held-back tool argument leaves the stream quiet: ping at least this often
 CTX_SLACK = 8               # `strata --serve` rejects prompt + max_new + 8 > context: keep the same margin here
@@ -7087,8 +7091,8 @@ def main() -> int:
     ap.add_argument("--config", help="strata engine config (JSON: exe, args, cwd, tokenizer, model_name), "
                                      "written by setup.py")
     ap.add_argument("--host", default=None,
-                    help="the address to listen on: 127.0.0.1 = this PC only (the default), 0.0.0.0 = also other devices "
-                         "on your network (set an API key); also \"host\" in the config")
+                    help="the address to listen on: 0.0.0.0 = also other devices on your network (the default here, "
+                         "with the default API key), 127.0.0.1 = this PC only; also \"host\" in the config")
     ap.add_argument("--script", action="append",
                     help="the mock engine's answer (default: a short greeting); given more than once, requests get "
                          "them in turn and the last one repeats")
@@ -7134,7 +7138,7 @@ def main() -> int:
         cfg["replicas"] = a.replicas
     if a.gpu is not None:
         cfg["gpu"] = int(a.gpu) if a.gpu.strip().isdigit() else a.gpu
-    a.host = a.host or cfg.get("host") or "127.0.0.1"   # issue #26: the run scripts pass no --host, the config can
+    a.host = a.host or cfg.get("host") or DEFAULT_HOST  # issue #26: the run scripts pass no --host, the config can
     try:                                                # before the minutes of loading: is the port free?
         Server((a.host, a.port), BaseHTTPRequestHandler).server_close()
     except OSError as e:
@@ -7262,6 +7266,11 @@ def main() -> int:
     if not svc.api_key and "api_key" in cfg:             # #569: written, but empty: the server has none (a warning, not a stop)
         print("[strata] the api_key in the config is empty: this server has no API key (anyone who can reach it can "
               "use it); set one, or leave api_key out", file=sys.stderr, flush=True)
+    if not svc.api_key and a.host not in LOOPBACK_NAMES:  # this fork: 0.0.0.0 is the default, so a key is always set
+        svc.api_key = DEFAULT_API_KEY
+        print(f'[strata] no API key was set: listening on {a.host} with the default "{DEFAULT_API_KEY}". '
+              'Change "api_key" in the config file (or --api-key / $STRATA_API_KEY); the chat page\'s API key '
+              "box takes it once", file=sys.stderr, flush=True)
     files_config = cfg.get("video_files")
     if files_config is not None:
         if not isinstance(files_config, dict) or not isinstance(files_config.get("enabled", False), bool):
