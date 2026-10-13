@@ -12,6 +12,15 @@ main() {
       echo "\"git pull\" here yourself, then run ./update.sh again."
       exit 1
     fi
+    # This fork's own changes live on the dev branch (main is the upstream mirror): a clone on another branch would
+    # update upstream's code instead, so say so instead of touching it.
+    branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
+    if [ "$branch" != "dev" ] && git show-ref --verify --quiet refs/remotes/origin/dev; then
+      echo "This is the video fork: its own changes live on the dev branch, and this clone is on $branch."
+      echo "Nothing was updated. Switch first, then run ./update.sh again:"
+      echo "  git switch dev"
+      exit 1
+    fi
     echo "Getting the newest Strata (git pull) ..."
     if ! git pull --ff-only; then
       # The history of the repository was rewritten on 2026-10-06 (#1276): a clone made before that has no commit in
@@ -53,7 +62,7 @@ main() {
     fi
   else
     echo "This copy of Strata was not made with git, so it cannot fetch new files itself. Download the newest one:"
-    echo "  https://github.com/Niko1221/Strata/archive/refs/heads/main.zip"
+    echo "  https://github.com/msola-ht/Strata/archive/refs/heads/dev.zip"
     echo "unzip it anywhere and run ./setup.sh (or ./update.sh) in it: it finds the model files in Strata-data and"
     echo "sets itself up the same way - nothing big is downloaded again."
     echo "Checking this copy's engine and settings meanwhile ..."
