@@ -5777,17 +5777,34 @@ def main() -> int:
                 warn("--layer-split is one engine's value; with replicas every group would get it: leave it at auto")
             if (os.cpu_count() or 0) < 8 * a.replicas:
                 warn("each replica loads its own copy of the model into RAM and runs its own host threads: check the RAM")
-    cfg["host"] = a.host or cfg.get("host") or DEFAULT_HOST               # this fork: LAN-reachable by default
+    # This fork: a new install is reachable from the LAN with the placeholder key below, and a setup run without
+    # --host / --api-key keeps what this model's own config already says - a rerun must not silently drop the
+    # user's key, nor pull a 127.0.0.1-only install back out onto the network.  Neither key is carried over from
+    # another install's config (`adopted`); #629's SETUP_KEYS rule is unchanged for everything else.
+    prev_path = ROOT / f"strata-{tag.lower()}.json"
+    prev: dict = {}
+    if prev_path.is_file():
+        try:
+            loaded = json.loads(prev_path.read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError):
+            loaded = None
+        if isinstance(loaded, dict):
+            prev = loaded
+    cfg["host"] = a.host or prev.get("host") or DEFAULT_HOST
     if a.api_key:
         cfg["api_key"] = a.api_key
-    elif not cfg.get("api_key") and cfg["host"] not in LOOPBACK_HOSTS:
-        cfg["api_key"] = DEFAULT_API_KEY      # ... with this key elsewhere; 127.0.0.1 needs no key
+    elif prev.get("api_key"):
+        cfg["api_key"] = prev["api_key"]
+    elif cfg["host"] not in LOOPBACK_HOSTS:
+        cfg["api_key"] = DEFAULT_API_KEY
     if draft_vocab:
         cfg["draft_vocab"] = draft_vocab
     if a.browser is not None:                          # #609: only when given (else an earlier choice is carried over)
         cfg["open_browser"] = a.browser
     else:
-        cfg.setdefault("open_browser", False)          # this fork: a server other devices reach opens no browser
+        # this fork: a server other devices reach opens no browser, but a choice made earlier (here or on the
+        # config's page) stands - only an install with nothing said about it gets the new default
+        cfg["open_browser"] = prev.get("open_browser", False)
     # #465: requests at once - written only when given (else an earlier "parallel" is carried over); a recommendation
     streaming = "--kv-resident" in args
     if a.parallel is not None:
