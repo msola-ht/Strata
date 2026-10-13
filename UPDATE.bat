@@ -6,18 +6,24 @@ rem START-HERE.bat. Options are passed on to setup.py.
 setlocal
 title Strata - update
 cd /d "%~dp0"
-rem This fork's own changes live on the dev branch (main is the upstream mirror): a clone on another branch would
-rem update upstream's code and, with --video, build against the wrong tree. Say so instead of touching it.
-if exist ".git" (
-  git rev-parse --abbrev-ref HEAD 2>nul | findstr /x /i "dev" >nul || (
-    git show-ref --verify --quiet refs/remotes/origin/dev && (
-      echo  This is the video fork: its own changes live on the dev branch, and this clone is on another one.
-      echo  Nothing was updated. Switch first, then run UPDATE.bat again:
-      echo    git switch dev
-      exit /b 1
-    )
-  )
-)
+rem This fork's own changes live on the dev branch (main is the upstream mirror): another branch would update
+rem upstream's code and, with --video, build against the wrong tree. Say so instead of touching it, unless
+rem STRATA_UPDATE_ANY_BRANCH is set. No pipe and no || chain here on purpose: cmd parses those inside a block
+rem unreliably, and the first version (a piped findstr) refused a clone that was already on dev.
+if defined STRATA_UPDATE_ANY_BRANCH goto :strata_branch_check_done
+set "STRATA_BRANCH="
+for /f "delims=" %%i in ('git symbolic-ref -q --short HEAD 2^>nul') do set "STRATA_BRANCH=%%i"
+if not defined STRATA_BRANCH goto :strata_branch_check_done
+if /i "%STRATA_BRANCH%"=="dev" goto :strata_branch_check_done
+git show-ref --verify --quiet refs/remotes/origin/dev
+if errorlevel 1 goto :strata_branch_check_done
+echo  This is the video fork: its own changes live on the dev branch, and this clone is on "%STRATA_BRANCH%".
+echo  Nothing was updated. Switch first, then run UPDATE.bat again:
+echo    git switch dev
+echo  Or set STRATA_UPDATE_ANY_BRANCH=1 to update this branch as it is.
+exit /b 1
+
+:strata_branch_check_done
 rem Video updates deliberately avoid the legacy history-reset fallback below.
 rem This mode accepts no setup options; use BUILD-VIDEO.ps1 directly for build options.
 if /i "%~1"=="--video" (

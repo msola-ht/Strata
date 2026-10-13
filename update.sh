@@ -12,13 +12,14 @@ main() {
       echo "\"git pull\" here yourself, then run ./update.sh again."
       exit 1
     fi
-    # This fork's own changes live on the dev branch (main is the upstream mirror): a clone on another branch would
-    # update upstream's code instead, so say so instead of touching it.
+    # This fork's own changes live on the dev branch (main is the upstream mirror): another branch would update
+    # upstream's code instead, so say so instead of touching it (STRATA_UPDATE_ANY_BRANCH=1 skips the check).
     branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
-    if [ "$branch" != "dev" ] && git show-ref --verify --quiet refs/remotes/origin/dev; then
+    if [ -z "${STRATA_UPDATE_ANY_BRANCH:-}" ] && [ "$branch" != "dev" ] \
+            && git show-ref --verify --quiet refs/remotes/origin/dev; then
       echo "This is the video fork: its own changes live on the dev branch, and this clone is on $branch."
-      echo "Nothing was updated. Switch first, then run ./update.sh again:"
-      echo "  git switch dev"
+      echo "Nothing was updated. Switch first (git switch dev), then run ./update.sh again."
+      echo "Or skip this check with STRATA_UPDATE_ANY_BRANCH=1 ./update.sh"
       exit 1
     fi
     echo "Getting the newest Strata (git pull) ..."
