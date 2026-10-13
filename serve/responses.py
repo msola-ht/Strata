@@ -83,12 +83,17 @@ def _content(content, param):
                                      "this server keeps no files", f"{param}[{j}]", "unsupported_parameter")
             parts.append({"type": "input_image", "image_url": part["image_url"]})
         elif kind in ("input_video", "video_url"):
+            if "file_id" in part:
+                if set(part) != {"type", "file_id"} or not isinstance(part["file_id"], str) or not part["file_id"]:
+                    raise ResponsesError("input_video requires exactly one of file_id or video_url", f"{param}[{j}]")
+                parts.append({"type": "input_video", "file_id": part["file_id"]})
+                continue
             source = part.get("video_url")
             if isinstance(source, dict) and set(source) == {"url"}:
                 source = source["url"]
             if not isinstance(source, str) or not source or set(part) - {"type", "video_url"}:
                 raise ResponsesError("input_video requires video_url (a string or {url: string}); "
-                                     "sampling overrides and file IDs are not supported", f"{param}[{j}]")
+                                     "sampling overrides are not supported", f"{param}[{j}]")
             parts.append({"type": "input_video", "video_url": source})
         else:
             raise ResponsesError(f"content parts of type {kind!r} are not supported (text, images and videos are)",

@@ -573,6 +573,79 @@ the OS file cache, so loading again takes seconds while that RAM is not needed e
 16 GB with Q2_0 in the low-RAM mode: unloading takes ~0.3 s, and a request to an unloaded model answered after
 4.6 s (text) or 14.7 s (a picture, image encoder on the CPU).
 
+**Release only the idle vision encoder (optional).** Add `"idle_unload_s": 600`
+inside the existing `"vision"` configuration object. The default is `0` (disabled);
+the value must be a finite, non-negative number of seconds. This setting is read
+at server startup and is separate from the top-level `idle_unload_s`. It is not
+supported with engine batching; startup rejects that combination.
+
+While the text engine stays resident, text requests do not wake the sleeping
+encoder or refresh its visual activity timer. Image requests, including tool
+images, wake it before preprocessing. Video Responses requests wake it within
+the video's existing deadline and cancellation budget. The timer waits for a
+safe engine turn and for visual work to finish; it never interrupts generation.
+Images remain protected until their cached embeddings have been copied into a
+request-owned file. Videos remain protected through generation and cleanup.
+File uploads and lookups do not count as visual activity.
+
+`POST /load` and `POST /v1/load` explicitly load both processes. A full cold start
+also retains the original vision-first order, even when triggered by text: the
+text engine sizes its cache after the encoder has taken its VRAM. Video requests
+still require the text engine to be loaded; independent vision wake does not
+introduce automatic full-model cold starts on that endpoint. Encoder-only wake
+does not run `before_load` or apply the full-model `min_free_vram_mib` threshold.
+It uses the VRAM released by the encoder; if another program or an explicit
+elastic-cache expansion has consumed it, startup can fail. Strata does not resize
+or restart the resident text engine to make room automatically.
+
+With this option enabled, `/v1/status` adds `vision.loaded` and
+`vision.idle_unload_s`. Logs report `vision stage=load elapsed_s=... ready=...`
+and confirmed `vision stage=idle_unload elapsed_s=...`. A process that fails to
+exit remains owned and blocks replacement; it is not reported as successfully
+unloaded. The idle worker stops when its HTTP server closes.
+
+The successful idle-unload log also reports fresh before/after memory readings:
+each monitored GPU's used MiB, system used RAM, and the encoder's RSS before exit
+(working set on Windows). Windows private commit is reported when available.
+`decrease` means before minus after and can be negative. GPU readings cover whole
+monitored cards and RAM readings cover the system; other programs, OS file caches
+and delayed driver accounting affect them. They are not exact encoder savings.
+The sampled GPUs include the existing telemetry devices plus an explicitly
+numbered `vision.cuda_device`, if configured. This does not change Monitor GPU
+aggregates. Custom device mappings outside those settings are not resolved.
+Missing readings say `unavailable`, not zero.
+No CPU percentage is inferred from two instantaneous snapshots; process exit
+confirms that the encoder no longer has running CPU threads.
+
+`GET /v1/status` retains the latest successful event as `vision.last_unload`,
+with `at`, `elapsed_s`, `process_exited`, `scope: whole_devices_and_system`,
+and `before`/`after` snapshots. Each
+snapshot includes its timestamp, `gpus` (`index`, `used_mib`),
+`system_ram_used_mib`, `process_rss_mib` and `process_private_mib`. Unavailable
+values, including process memory after exit, are `null`. Before any successful
+idle unload, `last_unload` is `null`; a failed unload does not publish a success.
+The record stays in memory only and keeps its original timestamp after reload.
+Sampling does not advance the Monitor's CPU/disk rate history and is best effort;
+missing telemetry does not prevent resource release.
+
+Development observations for this reporting change used Linux without GPU
+readings: direct sampling of a live OS `sleep` process reported 1.93 MiB RSS;
+after terminating and waiting for it, process readings were `null`. Both the
+default GPU and an additional requested GPU were retained with `null` readings.
+A temporary loopback server returned `vision.last_unload: null` before any
+unload and served a text Responses request with HTTP 200 `completed`. These
+observations check sampling and the API, not native encoder unloading. Real
+Windows working-set/private-commit and GPU before/after measurements remain to
+be observed on the deployed model.
+
+Unloading preserves the vision work directory, image embeddings and uploaded
+video references. A restarted encoder has a new video-cache identity, so a valid
+file ID can be reused but its visual preprocessing is performed again. See
+[VIDEO_FILES.md](VIDEO_FILES.md) for errors, cancellation and observed limits.
+This is Python server behavior; no native engine rebuild is needed. Apply the
+configuration through the normal server restart procedure. Roll back by setting
+the nested value to `0` or removing it; no file migration or cleanup is required.
+
 **Giving part of the VRAM back while it keeps serving (#533, opt-in, one NVIDIA GPU; every request and answer:
 [VRAM_ELASTIC.md](VRAM_ELASTIC.md)).** With `"vram_elastic": true`
 in the config (the engine flag `--vram-elastic`), the expert cache is allocated in 512 MiB segments
@@ -1586,7 +1659,9 @@ Example request body (use the deployment's API key in the Authorization header):
 }
 ```
 
-`video_url` can also be `{"url": "..."}` or a `data:video/mp4;base64,...` string. Local paths, uploaded file IDs,
+`video_url` can also be `{"url": "..."}` or a `data:video/mp4;base64,...` string. With the optional authenticated
+[video file store](VIDEO_FILES.md), `input_video` can instead use `file_id` for repeated questions and bounded
+visual preprocessing reuse. Without that opt-in, uploaded file IDs are rejected. Local paths,
 per-part sampling overrides, non-user video blocks, multiple videos and mixed video/image requests are rejected.
 The video route currently covers Responses only; text, image and tool requests keep their existing API paths.
 MOV/MP4, Matroska/WebM, AVI and MPEG-TS containers are accepted when FFmpeg can decode them. Playlists, changing
@@ -1599,8 +1674,9 @@ Limits are server policy. Defaults also include `max_source_bytes: 67108864`, `m
 65536 source frames, 16 Mi pixels per source frame, 1024 visual rows per pair, 65536 total visual rows and an
 1800-second preparation deadline. The RGB packet is at most 256 MiB; native embeddings are at most 671098880
 bytes. Codec processes have a 2 GiB per-process memory ceiling. Only one video request prepares or generates at a
-time; queued video requests have the same preparation deadline. Video embeddings are request-owned and are not
-cached. The directory can contain the source JSON/base64, source video, up to two RGB representations and one
+time on the URL path; queued video requests have the same preparation deadline. URL video embeddings are
+request-owned and uncached; the opt-in file store has separate bounded preprocessing and cache ownership.
+The directory can contain the source JSON/base64, source video, up to two RGB representations and one
 embedding artifact at different stages; these limits do not promise one small fixed file. Ensure adequate free
 space. Text/image traffic does not take the video slot; encoding still takes the existing inference FIFO.
 

@@ -191,6 +191,11 @@ def _parts_of(content):
         if part.get("type") in IMAGE_PARTS:
             items.append({"type": "image", "source": _image_source(part)})
         elif part.get("type") in VIDEO_PARTS:
+            if "file_id" in part:
+                if set(part) != {"type", "file_id"} or not isinstance(part["file_id"], str) or not part["file_id"]:
+                    raise ValueError("a video requires exactly one of file_id or video_url")
+                items.append({"type": "video", "source": {"file_id": part["file_id"]}})
+                continue
             source = part.get("video_url") or part.get("source")
             if isinstance(source, dict):
                 source = source.get("url")

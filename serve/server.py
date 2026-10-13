@@ -60,6 +60,7 @@ from serve.frontend import (THINK_END, ChatTemplate, Event, OutputParser, anthro
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 from serve import runconfig  # noqa: E402
 from serve import video as video_api  # noqa: E402
+from serve import video_store  # noqa: E402
 from serve import logit_bias as bias_api  # noqa: E402
 from serve.winjob import contain  # noqa: E402
 from serve.structured import StructuredOutputError, prepare_format, validated_json  # noqa: E402
@@ -2002,6 +2003,15 @@ class Vision:
         return Path(tempfile.mkdtemp(prefix="strata-vision-"))
 
     def __init__(self, cfg: dict, log=None, env: dict | None = None, lazy: bool = False):
+        idle = cfg.get("idle_unload_s", 0)
+        if isinstance(idle, bool) or not isinstance(idle, (int, float)) or not math.isfinite(idle) or idle < 0:
+            raise ValueError("vision.idle_unload_s must be a finite non-negative number (0 disables it)")
+        self.idle_unload_s = float(idle)
+        self.resource_gpu_index = None
+        device = cfg.get("cuda_device")
+        if cfg.get("gpu") and device is not None and str(device).isascii() and str(device).isdecimal():
+            if len(str(device)) <= 10 and int(device) < 2**31:
+                self.resource_gpu_index = int(device)
         absolute = lambda p: os.path.abspath(p) if os.path.dirname(str(p)) else p   # the encoder runs in its own dir (#480)  # noqa: E731
         args = [absolute(cfg["exe"]), "--mmproj", absolute(cfg["mmproj"]), "--model", absolute(cfg["model"])]
         if cfg.get("gpu"):
@@ -2023,7 +2033,9 @@ class Vision:
         if not lazy:
             self._start()
 
-    def _start(self):
+    def _start(self, budget=None):
+        if budget is not None:
+            budget.check()
         args, log, env = self.spawn
         # cwd is the encoder's directory: the ENC lines name the files relative to it (#480: no space in the line)
         self.proc = popen("the image encoder", args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -2031,25 +2043,34 @@ class Vision:
                           cwd=self.dir)
         contain(self.proc)
         try:
-            line = self._readline(VISION_READY_S, "the vision encoder did not start")
-        except RuntimeError as e:                       # silent for VISION_READY_S: it was ended, and it is not left half-started
-            self.proc, self.stopped = None, True
-            raise RuntimeError(str(e)) from None
-        if not line.startswith("READY"):
-            proc, self.proc = self.proc, None
+            line = self._readline(VISION_READY_S, "the vision encoder did not start", budget)
+            if not line.startswith("READY"):
+                raise RuntimeError(vision_start_error(line, self.spawn[1]))
+        except BaseException:
+            # A timed-out/cancelled startup owns this process; reap it before
+            # another request may start an encoder or reuse the FIFO.
+            proc = self.proc
             self.stopped = True
             try:
                 proc.kill()
+            except OSError:
+                pass                                # it may already have exited; still reap and close its pipes
+            try:
                 proc.wait(timeout=5)
-            except (OSError, subprocess.TimeoutExpired):
-                pass
-            raise RuntimeError(vision_start_error(line, self.spawn[1]))
+            except subprocess.TimeoutExpired:
+                raise EngineStuck("the vision encoder is still stopping after startup cancellation") from None
+            self.proc = None
+            proc.stdin.close()
+            proc.stdout.close()
+            raise
         self.stopped = False
 
         self.video_capable = "video=SVF2" in line.split()
+        # A new resident encoder is a new identity, even if weights were replaced in place.
+        self.video_identity = uuid.uuid4().hex
 
     def encode_video(self, packet, output, budget):
-        """No video cache: one request owns the packet and all output until handoff."""
+        """Encode one packet; the caller owns the output (and any cache publication)."""
         with video_api.acquire(self.lock, budget):
             if not self.video_capable or not self.alive():
                 raise video_api.VideoError("video requires a rebuilt strata-vision with SVF2 capability")
@@ -2123,7 +2144,7 @@ class Vision:
                 if reader.ident is not None:
                     reader.join(timeout=5)
 
-    def _readline(self, timeout: float, what: str) -> str:
+    def _readline(self, timeout: float, what: str, budget=None) -> str:
         """One line from the encoder, waiting at most `timeout` s (#1317).  On a timeout the encoder is killed, so the
         next request starts a fresh one, and the read raises RuntimeError instead of holding the request turn."""
         proc = self.proc
@@ -2137,19 +2158,35 @@ class Vision:
 
         threading.Thread(target=read, daemon=True).start()
         try:
-            return got.get(timeout=timeout)
+            if budget is None:
+                return got.get(timeout=timeout)
+            deadline = time.monotonic() + timeout
+            while True:
+                budget.check()
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise queue.Empty
+                try:
+                    line = got.get(timeout=min(0.1, remaining))
+                    budget.check()
+                    return line
+                except queue.Empty:
+                    continue
         except queue.Empty:
             try:
                 proc.kill()
             except OSError:
                 pass
+            if budget is not None:
+                raise video_api.VideoError(f"{what}: startup timed out after {timeout:.0f} s") from None
             raise RuntimeError(f"{what}: it said nothing for {timeout:.0f} s") from None
 
     def alive(self) -> bool:
-        return self.proc is not None and not self.stopped and self.proc.poll() is None
+        proc = self.proc
+        return proc is not None and not self.stopped and proc.poll() is None
 
     def video_available(self) -> bool:
-        return bool(self.video_policy and self.video_capable and self.alive()
+        return bool(self.video_policy and self.video_capable and (self.alive() or self.idle_unload_s)
                     and all(shutil.which(self.video_policy[k]) for k in ("ffmpeg", "ffprobe")))
 
     def unload(self):
@@ -2157,16 +2194,23 @@ class Vision:
         self.close()
         self.stopped = True
 
-    def restart(self):
+    def restart(self, budget=None):
         """Start the encoder again after an unload (or if it died); the cache of encoded images is kept."""
         if self.proc is not None:
+            self.stopped = True
             try:
                 self.proc.kill()
             except OSError:
                 pass
+            try:
+                self.proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                raise EngineStuck("the previous vision encoder is still stopping") from None
+            self.proc.stdin.close()
+            self.proc.stdout.close()
         self.proc = None
         self.stopped = True
-        self._start()
+        self._start(budget)
 
     @staticmethod
     def load(source: str) -> bytes:
@@ -2295,24 +2339,34 @@ class Vision:
             return self.cache[key]
 
     def close(self):
-        proc, self.proc = self.proc, None
+        proc = self.proc
+        self.stopped = True
         if proc is None:
-            self.stopped = True
             return
         try:
-            proc.stdin.write("QUIT\n")
-            proc.stdin.flush()
-            proc.wait(timeout=10)
-        except Exception:
             try:
-                proc.kill()
-            except OSError:
-                pass
-            try:
+                if proc.poll() is None:
+                    proc.stdin.write("QUIT\n")
+                    proc.stdin.flush()
+                    proc.wait(timeout=10)
+            except (OSError, ValueError, subprocess.TimeoutExpired):
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
                 proc.wait(timeout=10)
-            except (OSError, subprocess.TimeoutExpired):
-                pass
-        self.stopped = True
+        except subprocess.TimeoutExpired:
+            # Keep ownership: a later unload/restart must reap this process,
+            # never start a second encoder while its VRAM is still held.
+            raise EngineStuck("the vision encoder is still releasing GPU/RAM; retry after it exits") from None
+        finally:
+            if proc.poll() is not None:
+                self.proc = None
+                for pipe in (proc.stdin, proc.stdout):
+                    try:
+                        pipe.close()
+                    except (OSError, ValueError):
+                        pass
 
     def shutdown(self):
         """#914: close() for good: the server ends, so the encoder's directory (one ~10 MB .sve per image, on a tmpfs
@@ -2893,6 +2947,8 @@ class Service:
         self.slot_save_path = None                    # --slot-save-path: /slots/0?action=save|restore (off when None)
         self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
         self.video_slot = threading.Lock()            # one bounded video preparation directory at a time
+        self.video_store = None                       # opt-in, authenticated, process-local file references
+        self.video_cache_slot = threading.Lock()       # bounds codec work independently of generation
         self.api_key = ""                              # when set, /v1/* needs it (Bearer or x-api-key)
         # #458 (opt-in, the config's "effort_position": "end"): a non-default reasoning effort goes in a short system
         # turn before the answer instead of the top of the prompt, so switching it keeps the cached conversation
@@ -2931,6 +2987,21 @@ class Service:
         self.last_request_at = None                      # when a request last started or finished
         self.started_at = time.time()
         self.status_lock = threading.Lock()
+        # Video preparation and generation share one lifecycle lease, even while
+        # the public queue counter hands off to _run. Guard both fields with status_lock.
+        self._video_requests = 0
+        self._unloading = False
+        self.vision_idle_unload_s = getattr(vision, "idle_unload_s", 0)
+        spawn_args = getattr(engine, "spawn", (None, []))[1]
+        if self.vision_idle_unload_s and (getattr(engine, "batch", 0)
+                or any(flag in spawn_args for flag in ("--batch", "--slots"))):
+            raise ValueError("vision.idle_unload_s does not support engine batching")
+        self._vision_requests = 0
+        self._image_prepare_lock = threading.Lock()
+        self._vision_last_used = time.monotonic()
+        self._idle_stop = threading.Event()
+        self._idle_thread = None
+        self._vision_last_unload = None
         self.mcp = None                                  # serve/mcp.py's McpHub when MCP servers are configured
         # sharing the GPU with other programs (all off by default): unload the engine after this many idle seconds,
         # only start it again when this much VRAM is free, and run this command first (e.g. to unload another
@@ -3082,10 +3153,20 @@ class Service:
         except Exception:
             return None
 
-    def ensure_loaded(self):
+    def ensure_loaded(self, *, vision=None):
         """Start the engine if it is not running (unloaded, or it died - issue #27), after the before_load hook and
         the free-VRAM check.  The caller holds self.fifo."""
-        if self.loaded() and not self._vision_down():
+        # A full cold start keeps the original vision-first VRAM sizing order.
+        # Only a resident text engine may leave its idle encoder asleep.
+        want_vision = (not self.vision_idle_unload_s or not self.loaded()) if vision is None else vision
+        if self.loaded() and (not want_vision or not self._vision_down()):
+            if vision is True:
+                self._vision_last_used = time.monotonic()
+            return
+        if self.vision_idle_unload_s and self.loaded() and want_vision:
+            # The resident engine already owns its VRAM. The full-model hook
+            # and free-VRAM threshold would incorrectly gate an encoder-only wake.
+            self.ensure_vision_loaded()
             return
         if self.before_load:
             cmd = self.before_load
@@ -3104,13 +3185,14 @@ class Service:
                 raise GpuBusy(f"the GPU is in use by another program: {free} MiB of VRAM free, the model needs "
                               f"{self.min_free_vram_mib} (min_free_vram_mib) - it stays unloaded until that is free")
         vision_started = False
-        if self._vision_down():                         # first, as at a start: a GPU encoder takes its VRAM before
+        if want_vision and self._vision_down():          # first, as at a start: a GPU encoder takes its VRAM before
             print("[strata] starting the vision encoder ...", flush=True)   # the engine sizes its cache
             try:
                 self.vision.restart()
             except Exception as e:
                 raise EngineDied(f"the vision encoder failed to start: {e}") from e
             vision_started = True
+            self._vision_last_used = time.monotonic()
         if self.loaded():
             return
         if getattr(self.engine, "unloaded", False):
@@ -3171,11 +3253,15 @@ class Service:
         print(f"[strata] {e}. {note} The next request starts the engine again."
               f"{' Its log: ' + log if log else ''}", flush=True)
 
-    def load(self):
+    def load(self, *, vision=None):
         """POST /load and every generation request: start the engine now if it is unloaded (raises GpuBusy)."""
         # a request is on its way: the idle thread must not unload between this and the request's own start
         self.last_request_at = time.time()
-        if self.loaded() and not self._vision_down():
+        want_vision = (not self.vision_idle_unload_s or not self.loaded()) if vision is None else vision
+        if (self.loaded() and (not want_vision or not self._vision_down())
+                and not (self.vision_idle_unload_s and vision is True)):
+            if vision is True:
+                self._vision_last_used = time.monotonic()
             return
         trace = getattr(self.request_trace, "record", None)
         waiting = time.perf_counter()
@@ -3193,7 +3279,7 @@ class Service:
                         trace["queue_s"] += round(loading - waiting, 3)
                         trace["state"] = "loading"
                 try:
-                    self.ensure_loaded()
+                    self.ensure_loaded(vision=vision)
                 finally:
                     if trace is not None:
                         with self.status_lock:
@@ -3212,13 +3298,17 @@ class Service:
         if not self.fifo.acquire(blocking=False):
             return "busy"
         try:
-            if not self.engine.alive():
-                return "not loaded"
             with self.status_lock:
-                if self.status.get("busy") or self.status.get("queued"):
+                if self.status.get("busy") or self.status.get("queued") or self._video_requests or self._vision_requests:
                     return "busy"
-            if idle_for is not None and time.time() - (self.last_request_at or self.started_at) < idle_for:
-                return "busy"
+                if idle_for is not None and time.time() - (self.last_request_at or self.started_at) < idle_for:
+                    return "busy"
+                # Publish the decision before releasing status_lock: a video
+                # request must not accept live processes already being closed.
+                self._unloading = True
+            if not self.engine.alive() and (self.vision is None or
+                    (not self.vision.alive() and getattr(self.vision, "proc", None) is None)):
+                return "not loaded"
             self.engine.unload()
             if self.vision is not None and hasattr(self.vision, "unload"):
                 self.vision.unload()
@@ -3226,21 +3316,121 @@ class Service:
                   "the next request loads it again", flush=True)
             return "unloaded"
         finally:
+            with self.status_lock:
+                self._unloading = False
             self.fifo.release()
 
-    def start_idle_unload(self):
-        if not self.idle_unload_s or not hasattr(self.engine, "unload"):
+    def ensure_vision_loaded(self, budget=None):
+        """Caller holds fifo and a visual activity lease; never restarts the text engine."""
+        if not self._vision_down():
             return
-        print(f"[strata] the model unloads after {self.idle_unload_s} s without requests", flush=True)
+        started = time.monotonic()
+        try:
+            self.vision.restart(budget=budget)
+        except video_api.VideoError:
+            raise
+        except Exception as e:
+            raise EngineDied(f"the vision encoder failed to start: {e}") from e
+        finally:
+            self._vision_last_used = time.monotonic()
+            print(f"[strata] vision stage=load elapsed_s={time.monotonic() - started:.3f} "
+                  f"ready={self.vision.alive()}", flush=True)
+
+    @contextlib.contextmanager
+    def image_activity(self):
+        # Register before waiting on fifo; unload uses the same status lock.
+        with self.status_lock:
+            self._vision_requests += 1
+        try:
+            # The image LRU has no per-entry pins. Serialize preparations until
+            # cached files have been copied to a request-owned embedding file.
+            with self._image_prepare_lock:
+                with self.fifo:
+                    self.ensure_loaded(vision=True)
+                yield
+        finally:
+            with self.status_lock:
+                self._vision_requests -= 1
+                self._vision_last_used = time.monotonic()
+
+    def unload_idle_vision(self):
+        """Keep the text engine and on-disk embeddings; close only an idle encoder."""
+        if not self.vision_idle_unload_s or not self.fifo.acquire(blocking=False):
+            return "busy"
+        try:
+            with self.status_lock:
+                if (self._vision_requests or self._video_requests or self.status.get("busy")
+                        or time.monotonic() - self._vision_last_used < self.vision_idle_unload_s):
+                    return "busy"
+                # Close outside status_lock. New visual requests register, then
+                # wait on fifo and reload; no request uses the process directly.
+            if not self.vision.alive() and getattr(self.vision, "proc", None) is None:
+                return "not loaded"
+            before = self._vision_resource_snapshot(getattr(self.vision, "proc", None))
+            started = time.monotonic()
+            self.vision.unload()
+            elapsed = time.monotonic() - started
+            after = self._vision_resource_snapshot()
+            report = {"at": time.time(), "elapsed_s": round(elapsed, 3), "process_exited": True,
+                      "scope": "whole_devices_and_system",
+                      "before": before, "after": after}
+            with self.status_lock:
+                self._vision_last_unload = report
+            def value(n):
+                return "unavailable" if n is None else f"{n:.1f}"
+            def change(a, b):
+                delta = None if a is None or b is None else a - b
+                return f"{value(a)}->{value(b)} decrease={value(delta)} MiB"
+            gpu_after = {g["index"]: g["used_mib"] for g in after["gpus"]}
+            gpu_changes = " ".join(f"gpu[{g['index']}]={change(g['used_mib'], gpu_after.get(g['index']))}"
+                                   for g in before["gpus"]) or "gpu=unavailable"
+            print(f"[strata] vision stage=idle_unload elapsed_s={elapsed:.3f} "
+                  f"process_exited=True process_rss_before_mib={value(before['process_rss_mib'])} "
+                  f"process_private_before_mib={value(before['process_private_mib'])} "
+                  f"{gpu_changes} system_ram={change(before['system_ram_used_mib'], after['system_ram_used_mib'])} "
+                  "scope=whole_devices_and_system", flush=True)
+            return "unloaded"
+        finally:
+            self.fifo.release()
+
+    def _vision_resource_snapshot(self, process=None):
+        try:
+            telemetry = getattr(self, "telemetry", None)
+            if telemetry is not None:
+                return telemetry.resource_snapshot(process)
+        except Exception:  # noqa: BLE001 - optional diagnostics must never block resource release
+            pass
+        return {"at": time.time(), "gpus": [], "system_ram_used_mib": None,
+                "process_rss_mib": None, "process_private_mib": None}
+
+    def start_idle_unload(self):
+        whole = self.idle_unload_s if hasattr(self.engine, "unload") else 0
+        intervals = [s for s in (whole, self.vision_idle_unload_s) if s > 0]
+        if not intervals:
+            return
+        if whole:
+            print(f"[strata] the model unloads after {whole} s without requests", flush=True)
+        if self.vision_idle_unload_s:
+            print(f"[strata] vision unloads independently after {self.vision_idle_unload_s} s without visual work",
+                  flush=True)
 
         def loop():
-            while True:
-                time.sleep(max(1.0, min(30.0, self.idle_unload_s / 4)))
+            floor = 0.1 if self.vision_idle_unload_s else 1.0
+            while not self._idle_stop.wait(max(floor, min(30.0, min(intervals) / 4))):
                 try:
-                    self.unload(idle_for=self.idle_unload_s)
+                    if whole:
+                        self.unload(idle_for=whole)
+                    if self.vision_idle_unload_s:
+                        self.unload_idle_vision()
                 except EngineStuck as e:                # tried again at the next turn; the thread keeps running
                     print(f"[strata] idle unload: {e}", flush=True)
-        threading.Thread(target=loop, daemon=True).start()
+        self._idle_thread = threading.Thread(target=loop, daemon=True, name="strata-idle-unload")
+        self._idle_thread.start()
+
+    def stop_idle_unload(self):
+        self._idle_stop.set()
+        if self._idle_thread is not None and self._idle_thread.ident is not None:
+            self._idle_thread.join()
 
     def set_shared(self, defaults) -> dict:
         """The Chat settings every client gets for what it leaves out; {} / None = clients use their own again."""
@@ -3285,6 +3475,8 @@ class Service:
                                                     "prefill_tok_s_mean": self._prefill_tok_s_mean()},
                                        gpu_index=int(getattr(self, "gpu_index", 0) or 0),
                                        gpu_indices=getattr(self, "gpu_indices", None),
+                                       resource_gpu_index=(getattr(self.vision, "resource_gpu_index", None)
+                                                           if self.vision_idle_unload_s else None),
                                        amd=getattr(self, "backend", None) == "hip")
             if getattr(self, "engine", None) is not None and hasattr(self.engine, "gpu_busy"):
                 # #1317: the quick frozen-engine check does not end an engine whose GPU is busy (a long prompt chunk on a
@@ -3447,6 +3639,7 @@ class Service:
         the APIs, what is running, and the last request's timings in llama.cpp's names.  /metrics has the rest."""
         with self.status_lock:
             s, totals = dict(self.status), dict(self.totals)
+            vision_last_unload = self._vision_last_unload
             last_t, last_at = (dict(self.last_timings) if self.last_timings else None), self.last_request_at
         tel = self.telemetry.snapshot() if getattr(self, "telemetry", None) else {"now": {}, "static": {}}
         hw, static = tel.get("now") or {}, tel.get("static") or {}
@@ -3469,7 +3662,10 @@ class Service:
             "concurrency": {"serving": max(1, int(getattr(self.engine, "batch", 0) or 0)),
                             "requested": max(1, int(getattr(self.engine, "batch", 0) or 0))},
             "dialects": ["/v1/chat/completions", "/v1/messages", "/v1/responses"],
-            "vision": {"enabled": images, "available": images, "error": None},
+            "vision": {"enabled": images, "available": images, "error": None,
+                       **({"loaded": not self._vision_down(), "idle_unload_s": self.vision_idle_unload_s,
+                           "last_unload": vision_last_unload}
+                          if self.vision_idle_unload_s else {})},
             "activity": {"requests": totals["requests"] + int(busy), "in_flight": int(busy) + int(s.get("queued") or 0),
                          "last_request_at": int(last_at) if last_at else None},
             "last_timings": last_t,
@@ -3543,6 +3739,11 @@ class Service:
         return fetched
 
     def prepare(self, messages, tools, kwargs, max_new=None, force=None, req=None):
+        activity = self.image_activity() if self.vision_idle_unload_s and images_of(messages) else contextlib.nullcontext()
+        with activity:
+            return self._prepare(messages, tools, kwargs, max_new, force, req)
+
+    def _prepare(self, messages, tools, kwargs, max_new=None, force=None, req=None):
         """-> (ids, thinking, max_new). An unset or non-positive max_new (some clients send -1) means "unlimited":
         the rest of the context.  `force` (forced_call): without thinking the reply starts with it, so it ends the
         prompt; with thinking, Service.run writes it once the thinking is over."""
@@ -3652,11 +3853,36 @@ class Service:
         visual_room = ctx - CTX_SLACK - len(ids) - (max_new if max_new and max_new > 0 and not self.fit_max_tokens else 1)
         if visual_room < 1:
             raise video_api.VideoContextError("video request exceeds the context window before video preparation")
+        if isinstance(videos[0], dict):
+            acquire_video = getattr(self.embeddings, "acquire_video", None)
+            if acquire_video is None:
+                raise video_api.VideoError("file video input requires an authenticated Responses request")
+            # Validate request fields, template markers and text capacity before any shared work.
+            self.embeddings.cached_video = acquire_video()
         with contextlib.nullcontext():                  # the handler holds video_slot through generation
             with tempfile.TemporaryDirectory(prefix="video-", dir=self.vision.dir) as directory:
-                packet = video_api.prepare(videos[0], directory, budget)
-                with video_api.acquire(self.fifo, budget):
-                    output, _, layout = self.vision.encode_video(packet, Path(directory) / "video.sve", budget)
+                cached = getattr(self.embeddings, "cached_video", None)
+                if cached is None:
+                    packet = video_api.prepare(videos[0], directory, budget)
+                with contextlib.ExitStack() as turn:
+                    with budget.stage("encode_queue"):
+                        turn.enter_context(video_api.acquire(self.fifo, budget))
+                    if cached is None:
+                        with budget.stage("encode"):
+                            output, _, layout = self.vision.encode_video(packet, Path(directory) / "video.sve", budget)
+                    else:
+                        artifact, layout, identity = cached
+                        if identity != self.vision.video_identity:
+                            raise video_api.VideoError("video encoder changed; retry the request")
+                        try:
+                            video_api.validate_artifact(artifact, layout, budget.settings)
+                        except (ValueError, OSError):
+                            raise video_store.StoreError("video_cache_corrupt", "invalid cached video artifact", 503) from None
+                        output = Path(directory) / "video.sve"
+                        with budget.stage("artifact_copy"), Path(artifact).open("rb") as source, output.open("wb") as target:
+                            while chunk := source.read(65536):
+                                budget.check()
+                                target.write(chunk)  # cache lease stays pinned; run() owns only this copy
                     replacement = []
                     for seconds, cells in layout:
                         replacement += self.tok.encode(f"<{seconds:.17g} seconds>", parse_special=False)
@@ -3670,6 +3896,8 @@ class Service:
                     if room < 1 or (max_new and max_new > room and not self.fit_max_tokens):
                         raise video_api.VideoContextError("video request exceeds the context window; reduce video or output budget")
                     max_new = room if max_new is None or max_new <= 0 else min(room, max_new)
+                    budget.trace.event("prompt", tokens=len(ids), visual_tokens=sum(cells for _, cells in layout),
+                                       context=ctx)
                     budget.check()
                     combined = self.vision.dir / ("video-request-" + uuid.uuid4().hex + ".sve")
                     self.embeddings.path = combined
@@ -3683,6 +3911,77 @@ class Service:
                         self.drop_embeddings()
                         raise
         return ids, kwargs.get("enable_thinking", True) is not False, max_new
+
+    @contextlib.contextmanager
+    def video_producer(self, source):
+        """A shared producer outlives its last HTTP waiter while codecs are stopping."""
+        with self.status_lock:
+            if self._unloading:
+                raise video_store.StoreError("video_unavailable", "model is unloading", 503)
+            self._video_requests += 1
+        try:
+            with self.video_store.retain(source):
+                yield
+        finally:
+            with self.status_lock:
+                self._video_requests -= 1
+                self.last_request_at = time.time()
+                self._vision_last_used = time.monotonic()
+
+    @contextlib.contextmanager
+    def cached_video(self, owner, file_id, budget):
+        store, vision = self.video_store, self.vision
+        identity = vision.video_identity
+        settings = dict(budget.settings)
+        with store.lease(owner, file_id) as source:
+            key = store.cache_key(source.sha256, settings, json.dumps(
+                {"encoder": identity, "args": vision.spawn[0], "format": "SVF2-SVE1-layout-v1"}, sort_keys=True))
+
+            def compute(own_budget, target):
+                cancel = own_budget.cancel
+                stage, started = "queue", time.monotonic()
+                try:
+                    with contextlib.ExitStack() as admission:
+                        with own_budget.stage("queue"):
+                            admission.enter_context(video_api.acquire(self.video_cache_slot, own_budget))
+                        admitted = time.monotonic()
+                        with tempfile.TemporaryDirectory(prefix="video-cache-", dir=vision.dir) as directory:
+                            stage = "decode"
+                            packet = video_api.prepare("", directory, own_budget, local_file=source.path)
+                            decoded = time.monotonic()
+                            stage = "queue"
+                            with contextlib.ExitStack() as turn:
+                                with own_budget.stage("encode_queue"):
+                                    turn.enter_context(video_api.acquire(self.fifo, own_budget))
+                                if identity != vision.video_identity:
+                                    raise video_api.VideoError("video encoder changed; retry the request")
+                                stage = "encode"
+                                encoding = time.monotonic()
+                                with own_budget.stage("encode"):
+                                    output, _, layout = vision.encode_video(packet, Path(directory) / "video.sve", own_budget)
+                                encoded = time.monotonic()
+                            video_api.validate_artifact(output, layout, settings)
+                            own_budget.check()
+                            with own_budget.stage("artifact_store"):
+                                store.copy_artifact(output, target, cancel)
+                            own_budget.check()
+                            print(f"[strata] video stage=preprocess queue_s={admitted-started:.3f} "
+                                  f"decode_sampling_s={decoded-admitted:.3f} encode_queue_s={encoding-decoded:.3f} "
+                                  f"encode_s={encoded-encoding:.3f}", flush=True)
+                            return layout
+                except video_api.VideoError as e:
+                    stage = getattr(e, "stage", stage)
+                    suffix = "cancelled" if cancel.is_set() else "timeout" if time.monotonic() >= own_budget.deadline else "failed"
+                    raise video_store.StoreError(f"video_{stage}_{suffix}", f"video {stage} {suffix}: {e}",
+                                                 499 if suffix == "cancelled" else 408 if suffix == "timeout" else 400) from None
+
+            started = time.monotonic()
+            with contextlib.ExitStack() as leases:
+                with budget.stage("cache_wait"):
+                    artifact, layout, hit = leases.enter_context(store.get_or_compute(
+                        key, budget, compute, producer_context=self.video_producer(source)))
+                print(f"[strata] video cache={hit} wait_s={time.monotonic()-started:.3f}", flush=True)
+                yield artifact, layout, identity
 
     PREFIX_END = "\u0001strata-prefix-end\u0001"          # marks where a message's shared part ends in the rendered prompt
 
@@ -3876,6 +4175,10 @@ class Service:
         segments = []
         trace = getattr(self.request_trace, "record", None)
         waiting = time.perf_counter()
+        video_trace = getattr(self.embeddings, "video_trace", None)
+        video_queue = contextlib.ExitStack()
+        if video_trace is not None:
+            video_queue.enter_context(video_trace.stage("generation_queue", cancel))
         # #465: with "parallel" (the engine's batch slots) requests run at once: each keeps its own status and rate
         # window (self.status says busy while any runs); one at a time they are self.status / self.rate, as before
         par = bool(getattr(self.engine, "batch", 0))
@@ -3911,6 +4214,9 @@ class Service:
                                    "reasoning_tokens": 0, "reasoning_recoveries": 0}
                     return
             with turn:
+                video_queue.close()
+                if video_trace is not None:
+                    turn.enter_context(video_trace.stage("generation", cancel, timeout_errors=(EngineSilent,)))
                 try:
                     with self.status_lock:
                         if trace is not None:
@@ -3926,7 +4232,7 @@ class Service:
                     try:
                         if not par:
                             self.ensure_loaded()
-                        elif not (self.loaded() and not self._vision_down()):
+                        elif not (self.loaded() and (self.vision_idle_unload_s or not self._vision_down())):
                             with self.fifo:
                                 self.ensure_loaded()
                     except BaseException:
@@ -4247,6 +4553,7 @@ class Service:
                                 self.status.pop("tail", None)
                                 self.status.pop("tool", None)
         finally:
+            video_queue.__exit__(*sys.exc_info())
             if emb:
                 Path(emb).unlink(missing_ok=True)
         for ev in cut(parser.finish(finish)):
@@ -4939,7 +5246,8 @@ def make_handler(svc: Service):
             else:
                 return
             self.send_header("Access-Control-Allow-Origin", allow)
-            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS" +
+                             (", DELETE" if svc.video_store is not None else ""))
             # the headers the preflight asks for (SDKs add their own; "*" does not cover Authorization)
             asked = self.headers.get("Access-Control-Request-Headers")
             self.send_header("Access-Control-Allow-Headers",
@@ -4980,8 +5288,81 @@ def make_handler(svc: Service):
             self._json(401, {"error": {"type": "authentication_error", "message": "missing or wrong API key"}})
             return False
 
+        def _file_owner(self):
+            auth = self.headers.get("Authorization", "")
+            key = auth[7:].strip() if auth.lower().startswith("bearer ") else self.headers.get("x-api-key", "")
+            # Authentication accepts UTF-8 and Latin-1 wire forms of a configured key.
+            # Both must refer to the same owner, rather than hashing the wire spelling.
+            matches = set()
+            for candidate in key_list(svc.api_key):
+                if key_matches(key, candidate):
+                    matches.add(candidate)
+            if not matches:
+                raise video_store.StoreError("authentication_error", "missing or wrong API key", 401)
+            if len(matches) != 1:
+                raise video_store.StoreError("authentication_error", "ambiguous API key encoding for video file access", 401)
+            matched = matches.pop()
+            return hashlib.sha256(matched.encode()).hexdigest()
+
+        def _files(self, file_id=None, delete=False):
+            if svc.video_store is None:
+                return self._json(404, responses_error_body("video files are disabled", code="video_files_disabled"))
+            try:
+                owner = self._file_owner()
+                if file_id is not None:
+                    result = (svc.video_store.delete(owner, file_id) if delete else
+                              svc.video_store.status(owner, file_id))
+                else:
+                    # Raw bytes avoid multipart copies and bound memory independently of upload size.
+                    self.close_connection = True
+                    self.body_read = True  # This streaming reader owns the body, including failed uploads.
+                    if self.headers.get("Transfer-Encoding") or len(self.headers.get_all("Content-Length", [])) != 1:
+                        raise video_store.StoreError("invalid_request", "upload requires one Content-Length and no Transfer-Encoding", 400)
+                    length = self.headers.get("Content-Length", "")
+                    if not length.isascii() or not length.isdigit():
+                        raise video_store.StoreError("invalid_request", "invalid upload Content-Length", 400)
+                    if len(length) > 20:
+                        raise video_store.StoreError("video_file_too_large", "video source exceeds its byte budget", 413)
+                    mime = self.headers.get("Content-Type", "").partition(";")[0]
+                    if mime != "application/octet-stream" and not mime.startswith("video/"):
+                        raise video_store.StoreError("invalid_request", "send raw video bytes, not multipart or JSON", 415)
+                    started = time.monotonic()
+                    handler = self
+                    class UploadReader:
+                        def read(self, count):
+                            remaining = 60 - (time.monotonic() - started)
+                            if remaining <= 0:
+                                raise TimeoutError("upload deadline exceeded")
+                            handler.connection.settimeout(remaining)
+                            return handler.rfile.read1(count)
+                    old_timeout = self.connection.gettimeout()
+                    try:
+                        result = svc.video_store.create(owner, UploadReader(), int(length))
+                    finally:
+                        self.connection.settimeout(old_timeout)
+                    print(f"[strata] video stage=upload bytes={result['bytes']} elapsed_s={time.monotonic()-started:.3f}", flush=True)
+                self._json(200, result)
+            except video_store.StoreError as e:
+                self._json(e.status, responses_error_body(str(e), code=e.code))
+            except TimeoutError:
+                self._json(408, responses_error_body("video upload deadline exceeded", code="video_upload_timeout"))
+            except OSError:
+                self._json(503, responses_error_body("video upload or storage failed", code="video_upload_failed"))
+
+        def do_DELETE(self):
+            path = self.path.split("?")[0].rstrip("/")
+            if not self._authorized() or self._foreign_page():
+                return
+            if path.startswith("/v1/files/"):
+                return self._files(path[len("/v1/files/"):], delete=True)
+            self._json(404, responses_error_body("not found", code="not_found"))
+
         def do_GET(self):
             path = self.path.split("?")[0].rstrip("/")
+            if path.startswith("/v1/files/"):
+                if self._authorized():
+                    self._files(path[len("/v1/files/"):])
+                return
             if path.startswith("/fonts/"):
                 # the web app's font (Outfit, OFL: serve/web/fonts); the page falls back to the system font
                 name = path[len("/fonts/"):]
@@ -5146,6 +5527,8 @@ def make_handler(svc: Service):
             path = self.path.split("?")[0].rstrip("/")   # issue #55: Claude Code posts /v1/messages?beta=true
             if path.startswith("/v1/") and self._foreign_page():
                 return
+            if path == "/v1/files":
+                return self._files()
             if path == "/settings":
                 self._settings()
                 return
@@ -5170,9 +5553,9 @@ def make_handler(svc: Service):
                 return
             if path == "/load":                              # load now, e.g. ahead of a request
                 try:
-                    svc.load()
+                    svc.load(vision=True)
                     self._json(200, {"status": "loaded"})
-                except GpuBusy as e:
+                except (GpuBusy, EngineDied, EngineStuck) as e:
                     self._json(503, {"error": {"type": "server_error", "message": str(e)}})
                 return
             try:
@@ -5200,7 +5583,7 @@ def make_handler(svc: Service):
                             with svc.status_lock:
                                 if svc.status.get("busy") or svc.status.get("queued"):
                                     raise ModelBusy("a request is running or queued")
-                            svc.ensure_loaded()
+                            svc.ensure_loaded(vision=True)
                             svc.last_request_at = time.time()
                         finally:
                             svc.fifo.release()
@@ -5599,6 +5982,11 @@ def make_handler(svc: Service):
             def check(text, finish):
                 return validated_json(text, validator, finish)
 
+            def generation_code(error):
+                if not getattr(self, "video_file_request", False) and not getattr(getattr(self, "video_trace", None), "enabled", False):
+                    return "server_error"
+                return "video_generation_timeout" if isinstance(error, EngineSilent) else "video_generation_failed"
+
             def events():
                 if not getattr(self, "video_stream_started", False):
                     yield from asm.start()
@@ -5628,11 +6016,11 @@ def make_handler(svc: Service):
                                                                 code="structured_output_failed"))
                 except EngineDied as e:
                     return self._json(503, responses_error_body(f"{e}; the next request restarts it", "server_error",
-                                                                code="server_error"))
+                                                                code=generation_code(e)))
                 except EngineNonFinite as e:                 # #879, twice: not the request's fault
-                    return self._json(503, responses_error_body(str(e), "server_error", code="server_error"))
+                    return self._json(503, responses_error_body(str(e), "server_error", code=generation_code(e)))
                 except ValueError as e:                      # the engine's ERR line
-                    return self._json(500, responses_error_body(str(e), "server_error", code="server_error"))
+                    return self._json(500, responses_error_body(str(e), "server_error", code=generation_code(e)))
                 return self._json(200, result)
             if not getattr(self, "video_stream_started", False):
                 self._sse()
@@ -5661,38 +6049,52 @@ def make_handler(svc: Service):
                 cancel.set()                                 # client went away: stop the engine
                 items.close()
             except EngineDied as e:                          # mid-stream: response.failed, then the stream ends
-                self._responses_failed(asm, f"{e}; the next request restarts it", "server_error", send)
+                self._responses_failed(asm, f"{e}; the next request restarts it", generation_code(e), send)
             except StructuredOutputError as e:
                 self._responses_failed(asm, str(e), "structured_output_failed", send)
             except ValueError as e:                          # the engine's ERR after the stream started
-                self._responses_failed(asm, str(e), "server_error", send)
+                self._responses_failed(asm, str(e), generation_code(e), send)
 
         def _responses_video(self, req):
             """Prepare off the socket thread; heartbeat timing follows actual writes.
 
-            A single slot covers preparation AND generation, bounding live video
-            artifacts. Worker thread-local embeddings are explicitly handed off.
+            A single slot covers URL preparation and all video generation. File
+            preprocessing has a bounded shared producer before that slot. Worker
+            thread-local request embeddings are explicitly handed off.
             """
             try:
                 responses_api.check_request(req)
                 messages = responses_api.input_messages(req)
                 if len(videos_of(messages)) != 1 or images_of(messages):
                     raise ResponsesError("send one video per request without image parts", "input")
+                source = videos_of(messages)[0]
+                file_id = source["file_id"] if isinstance(source, dict) else None
+                self.video_file_request = file_id is not None
+                if file_id is not None:
+                    if any(m.get("role") != "user" and videos_of([m]) for m in messages):
+                        raise ResponsesError("video input is supported in user messages only", "input")
+                    if svc.video_store is None:
+                        raise ResponsesError("video files are disabled", "input", "video_files_disabled")
+                    svc.video_store.status(self._file_owner(), file_id)
                 if svc.vision is None or svc.vision.video_policy is None:
                     raise ResponsesError("video is disabled; enable vision.video.enabled", "input", "video_unavailable")
                 if getattr(svc.engine, "batch", 0):
                     raise ResponsesError("video input is not supported with engine batching", "input", "video_unavailable")
-                if not svc.loaded() or not svc.vision.alive():
+                if not svc.loaded() or (not svc.vision_idle_unload_s and not svc.vision.alive()):
                     raise ResponsesError("load the model and vision encoder before sending video", "input",
                                          "video_unavailable", status=503)
-                if not svc.vision.video_capable:
+                if not svc.vision.video_capable and (not svc.vision_idle_unload_s or svc.vision.alive()):
                     raise ResponsesError("rebuild strata-vision with SVF2 video support", "input", "video_unavailable")
                 tools, names, _ = responses_api.request_tools(req)
+            except video_store.StoreError as e:
+                return self._json(e.status, responses_error_body(str(e), code=e.code))
             except ResponsesError as e:
                 return self._json(e.status, e.body())
             cancel = self.video_cancel = threading.Event()
             self._watch_client(cancel)
             budget = video_api.Budget(svc.vision.video_policy, cancel)
+            self.video_trace = budget.trace
+            budget.trace.event("request", event="start", source="file" if file_id is not None else "url")
             asm = responses_api.Assembler(req, svc.model_for(req), 0, names, False)
 
             def send(e):
@@ -5705,11 +6107,16 @@ def make_handler(svc: Service):
 
             last = time.monotonic()
             held, worker = False, None
-            with svc.status_lock:
-                svc.status["queued"] += 1
-            counted = True
+            counted = admitted = False
             box, ready = {}, threading.Event()
             try:
+                with svc.status_lock:
+                    if svc._unloading or not svc.loaded() or (not svc.vision_idle_unload_s and not svc.vision.alive()):
+                        raise ResponsesError("load the model and vision encoder before sending video", "input",
+                                             "video_unavailable", status=503)
+                    svc._video_requests += 1
+                    svc.status["queued"] += 1
+                    counted = admitted = True
                 if req.get("stream"):
                     self._sse()
                     self.video_stream_started = True
@@ -5723,21 +6130,39 @@ def make_handler(svc: Service):
                         send(asm.in_progress())
                         last = time.monotonic()
 
-                while not held:
-                    beat()
-                    held = svc.video_slot.acquire(timeout=0.1)
+                if file_id is None:
+                    with budget.stage("queue"):
+                        while not held:
+                            beat()
+                            held = svc.video_slot.acquire(timeout=0.1)
 
                 def prepare():
+                    nonlocal held
                     svc.embeddings.video_budget = budget
                     svc.request_trace.record = self.record
                     try:
-                        box["result"] = self._responses_prepare(req)
-                        budget.check()
-                        box["path"] = getattr(svc.embeddings, "path", None)
-                        svc.embeddings.path = None
+                        with contextlib.ExitStack() as leases:
+                            def acquire_video():
+                                nonlocal held
+                                cached = getattr(svc.embeddings, "cached_video", None)
+                                if cached is None:
+                                    cached = leases.enter_context(svc.cached_video(self._file_owner(), file_id, budget))
+                                with budget.stage("queue"):
+                                    while not held:
+                                        budget.check()
+                                        held = svc.video_slot.acquire(timeout=0.1)
+                                return cached
+                            if file_id is not None:
+                                svc.embeddings.acquire_video = acquire_video
+                            box["result"] = self._responses_prepare(req)
+                            budget.check()
+                            box["path"] = getattr(svc.embeddings, "path", None)
+                            svc.embeddings.path = None
                     except Exception as e:
                         box["error"] = e
                     finally:
+                        svc.embeddings.acquire_video = None
+                        svc.embeddings.cached_video = None
                         try:
                             svc.drop_embeddings()
                         except OSError as e:
@@ -5760,6 +6185,7 @@ def make_handler(svc: Service):
                     prepared_asm.seq = asm.seq
                 asm = prepared_asm
                 svc.embeddings.path = box.pop("path", None)
+                svc.embeddings.video_trace = budget.trace
                 self.video_prepared = result
                 with svc.status_lock:
                     svc.status["queued"] -= 1
@@ -5769,11 +6195,22 @@ def make_handler(svc: Service):
                 cancel.set()
                 self._note(outcome="disconnected")
             except Exception as e:
+                if getattr(self, "video_stage", None) == "load" and isinstance(e, video_api.VideoError):
+                    code = "video_load_cancelled" if cancel.is_set() else "video_load_timeout"
+                    e = ResponsesError(str(e), "input", code, status=499 if cancel.is_set() else 408)
+                elif (file_id is not None or budget.trace.enabled) and isinstance(e, video_api.VideoError):
+                    stage = getattr(e, "stage", "preparation")
+                    suffix = "cancelled" if cancel.is_set() else "timeout" if time.monotonic() >= budget.deadline else "failed"
+                    e = video_store.StoreError(f"video_{stage}_{suffix}", str(e),
+                                              499 if suffix == "cancelled" else 408 if suffix == "timeout" else 400)
+                budget.trace.event("request", event="error", code=getattr(e, "code", None) or "video_preparation_failed")
                 cancel.set()
                 message = str(e) if isinstance(e, (ValueError, EngineDied)) else "video preparation failed"
                 if getattr(self, "video_stream_started", False):
-                    code = e.code if isinstance(e, ResponsesError) and e.code else "video_preparation_failed"
+                    code = e.code if isinstance(e, (ResponsesError, video_store.StoreError)) and e.code else "video_preparation_failed"
                     self._responses_failed(asm, message, code, send)
+                elif isinstance(e, video_store.StoreError):
+                    self._json(e.status, responses_error_body(str(e), code=e.code))
                 elif isinstance(e, ResponsesError):
                     self._json(e.status, e.body())
                 else:
@@ -5789,11 +6226,17 @@ def make_handler(svc: Service):
                         Path(path).unlink(missing_ok=True)
                     svc.drop_embeddings()
                 finally:
+                    svc.embeddings.video_trace = None
                     if held:
                         svc.video_slot.release()
-                    if counted:
-                        with svc.status_lock:
+                    with svc.status_lock:
+                        if counted:
                             svc.status["queued"] -= 1
+                        if admitted:
+                            svc._video_requests -= 1
+                            svc.last_request_at = time.time()
+                            svc._vision_last_used = time.monotonic()
+                    budget.trace.event("cleanup", event="released", scope="request")
 
         def _responses_failed(self, asm, message, code, send):
             e = asm.failed(message, code)
@@ -5839,7 +6282,22 @@ def make_handler(svc: Service):
             video_budget = getattr(svc.embeddings, "video_budget", None)
             if video_budget is not None:
                 video_budget.check()
-                if not svc.loaded() or svc._vision_down():
+                if not svc.loaded():
+                    raise EngineStarting("load the model and vision encoder before sending video")
+                if svc.vision_idle_unload_s:
+                    self.video_stage = "load"
+                    try:
+                        with contextlib.ExitStack() as turn:
+                            with video_budget.stage("load_queue"):
+                                turn.enter_context(video_api.acquire(svc.fifo, video_budget))
+                            with video_budget.stage("load"):
+                                svc.ensure_vision_loaded(video_budget)
+                    except video_api.VideoError:
+                        raise
+                    except Exception as e:
+                        raise ResponsesError(str(e), "input", "video_load_failed", status=503) from e
+                    self.video_stage = "prepare"
+                elif svc._vision_down():
                     raise EngineStarting("load the model and vision encoder before sending video")
                 svc.last_request_at = time.time()
             else:
@@ -5851,14 +6309,18 @@ def make_handler(svc: Service):
                 try:
                     ids, thinking, max_new = svc.prepare(messages, shown, kw, req.get("max_output_tokens") or 0, req=req)
                 except ValueError as e:
-                    if shown is tools or (isinstance(e, video_api.VideoError)
+                    if shown is tools or isinstance(e, video_store.StoreError) or (isinstance(e, video_api.VideoError)
                                           and not isinstance(e, video_api.VideoContextError)):
                         raise
                     shown = tools                            # too long with the kept tools: the request as sent
                     ids, thinking, max_new = svc.prepare(messages, shown, kw, req.get("max_output_tokens") or 0, req=req)
-            except ResponsesError:
+            except (ResponsesError, video_store.StoreError):
                 raise
             except ValueError as e:                          # too long for the context, an image without vision
+                if isinstance(e, video_api.VideoError) and not isinstance(e, video_api.VideoContextError) \
+                        and video_budget is not None and (getattr(self, "video_file_request", False)
+                                                          or video_budget.trace.enabled):
+                    raise  # Preserve the stage and cancellation state through the HTTP error boundary.
                 raise ResponsesError(str(e), "input", "context_length_exceeded" if "context" in str(e) else None) \
                     from None
             if svc.codex_compaction_cache:
@@ -5938,13 +6400,27 @@ class Server(ThreadingHTTPServer):
         if not isinstance(sys.exc_info()[1], ConnectionError):   # a client that hangs up needs no stack trace
             super().handle_error(request, client_address)
 
+    def shutdown(self):
+        svc = getattr(self, "svc", None)
+        if svc is not None:
+            svc.stop_idle_unload()
+        super().shutdown()
+
     def server_close(self):
+        svc = getattr(self, "svc", None)
+        if svc is not None:
+            svc.stop_idle_unload()
         # the hardware sampler serve() started for this server stops with it (test isolation: every Service a test
         # started used to leave its sampler running, 21 of them after test_responses, which slowed test_parallel's timing)
         tel = getattr(getattr(self, "svc", None), "telemetry", None)
         if tel is not None and hasattr(tel, "close"):
             tel.close()
+        store = getattr(getattr(self, "svc", None), "video_store", None)
+        if store is not None:
+            store.close()
         super().server_close()
+        if store is not None:
+            store.wait_for_producers()
 
 
 def warn_tight_ram(arena_mib) -> None:
@@ -6528,6 +7004,10 @@ def main() -> int:
             print(f"[strata] sampling defaults from the config: {pretty}", flush=True)
         lazy = a.lazy or cfg.get("lazy_load") is True
         if cfg.get("vision"):
+            if cfg["vision"].get("idle_unload_s"):
+                args = cfg.get("args", [])
+                if any(flag in args for flag in ("--batch", "--slots")) or parallel_args(cfg, args):
+                    ap.error("vision.idle_unload_s does not support engine batching")
             print("loading the vision encoder ..." if not lazy else
                   "vision encoder unloaded; it starts with the model ...", flush=True)
             # relative paths are the config's cwd's, as for the engine below
@@ -6620,6 +7100,14 @@ def main() -> int:
     if not svc.api_key and "api_key" in cfg:             # #569: written, but empty: the server has none (a warning, not a stop)
         print("[strata] the api_key in the config is empty: this server has no API key (anyone who can reach it can "
               "use it); set one, or leave api_key out", file=sys.stderr, flush=True)
+    files_config = cfg.get("video_files")
+    if files_config is not None:
+        if not isinstance(files_config, dict) or not isinstance(files_config.get("enabled", False), bool):
+            raise SystemExit("[strata] video_files must be an object with enabled: true or false")
+        if files_config.get("enabled"):
+            if not svc.api_key or svc.vision is None or svc.vision.video_policy is None:
+                raise SystemExit("[strata] video_files requires an API key and vision.video.enabled")
+            svc.video_store = video_store.VideoStore(files_config, svc.vision.video_policy["max_source_bytes"])
     svc.cors_origins = origins_of(cfg.get("cors_origins"), "cors_origins", wildcard=True)
     svc.trusted_origins = origins_of(cfg.get("trusted_origins"), "trusted_origins", wildcard=False)
     try:
@@ -6744,7 +7232,9 @@ def main() -> int:
             time.sleep(1)                               # Windows never delivers Ctrl+C to an untimed Event.wait()
     except KeyboardInterrupt:
         print("\n[strata] stopping (Ctrl+C again to end the engine at once) ...", flush=True)
-        closers = [httpd.shutdown, getattr(engine, "close", None), vision.shutdown if vision else None,
+        closers = [httpd.shutdown, svc.video_store.close if svc.video_store is not None else None,
+                   getattr(engine, "close", None), httpd.server_close if svc.video_store is not None else None,
+                   vision.shutdown if vision else None,
                    hub.close if hub is not None else None]
         for close in filter(None, closers):
             try:
