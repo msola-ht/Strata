@@ -21,8 +21,9 @@ this top-level setting to the server configuration, alongside an API key:
 
 `vision.video.enabled` must also be true. Startup refuses file support without
 an API key or enabled video policy. The text model must be loaded before analysis.
-The SVF2 vision encoder must also be loaded unless independent vision idle
-unloading is enabled as described below. File upload itself does not load the model. Disabling or
+The SVF2 vision encoder must be loadable; it may already be resident, or start
+on demand through independent vision idle unloading or the elastic vision
+setting described below. File upload itself does not load the model. Disabling or
 omitting `video_files.enabled` leaves URL video preparation uncached. The existing
 single-video, user-message-only, no-image-mixing and no-engine-batching restrictions
 still apply. No generation or reasoning budget is added by this feature.
@@ -53,6 +54,16 @@ an explicit `/v1/load` also preloads it. Engine batching is not supported with
 this option. Full model cold starts retain vision-first loading for VRAM sizing;
 this video endpoint still requires a loaded text model. Details and rollback:
 [independent vision idle unloading](DETAILS.md#sharing-the-gpu-with-other-programs-optional).
+
+With `"elastic": true` inside `vision` and top-level `"vram_elastic": true`, the
+first image or video request makes the expert cache keep the configured
+`elastic_mib` free and starts the encoder. Video preparation and generation
+hold the same visual activity lease as the idle-unload path, so the encoder is
+not stopped between queue handoffs. `elastic_idle_s` starts again after image or
+video work ends, including failed or cancelled work. `/v1/load` does not start
+an elastic encoder; the next image or video does. `vision.idle_unload_s` and
+`vision.elastic` are mutually exclusive. Details:
+[the encoder on demand](VRAM_ELASTIC.md#the-image-encoder-on-demand).
 
 For video, FIFO waiting and encoder READY waiting use the same video request
 deadline and cancellation event as preprocessing. Encoder startup is also bounded
