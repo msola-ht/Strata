@@ -42,9 +42,10 @@ until the producer has stopped its codec work and removed its preparation direct
 The producer's lease does not keep a cancelled waiter connected.
 
 Model unloading does not remove uploaded files or extend their TTL. Restarting
-the encoder changes its cache identity, so a still-valid file reference can be
-reused but requires preprocessing again. Existing cache entries remain subject
-to the usual TTL and capacity eviction.
+the encoder keeps its cache identity while the executable, model, projector,
+arguments and artifact format are unchanged, so a valid file reference can
+reuse preprocessing. Replacing any of those files causes a miss. Existing cache
+entries remain subject to the usual TTL and capacity eviction.
 
 To make the encoder elastic, add `"elastic": true` inside `vision` and choose
 `elastic_idle_s` (default 120). With top-level `"vram_elastic": true`, the first
@@ -102,7 +103,7 @@ All settings below belong to `video_files`:
 | `cache_max_entries` | 16 | Cache entries and pending computations |
 | `cache_max_entry_bytes` | 671098880 | Maximum one embedding artifact; reserved before computation |
 | `cache_ttl_s` | 3600 | Artifact lifetime from publication |
-| `cache_max_workers` | 1 | Concurrent producer admission; allowed values 1 or 2 |
+| `cache_max_workers` | 1 | Concurrent producer admission; currently capped at 1 because encoding shares the inference FIFO |
 | `directory` | OS temporary directory | Existing parent for the private store directory |
 
 Byte totals are capped at 8 GiB, counts at 512, entry size at 1 GiB and TTLs at
@@ -232,9 +233,11 @@ rules on every call, including cache hits. Do not send a new hard-coded
 ## Cache, errors and cancellation
 
 The cache key includes content SHA-256, all video policy settings, encoder
-startup arguments (model, projector and visual token settings), a resident
-encoder identity renewed on every restart, and a format version. Changes cause
-a miss. A hit verifies artifact size, SHA-256, SVE1 records and layout limits,
+startup arguments (model, projector and visual token settings), a stable
+encoder identity, and a format version. The identity covers the executable,
+model and projector paths with their size and nanosecond mtime, so an elastic
+unload/restart alone does not cause a miss. Replacing or rebuilding any of
+those files does. A hit verifies artifact size, SHA-256, SVE1 records and layout limits,
 then makes a request-owned copy. `os.replace` and `drop_embeddings` act on that
 copy only. No cached prompt or answer is reused. Existing `video_url` calls remain
 uncached and keep downloading/preparing their source.

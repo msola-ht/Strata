@@ -36,6 +36,7 @@ import math
 import os
 import queue
 import re
+import secrets
 import select
 import signal
 import socket
@@ -215,9 +216,9 @@ def focused_recovery_prompt(tok, ids, generated):
 
 LOOPBACK_NAMES = ("localhost", "127.0.0.1", "::1")
 # This fork's own defaults (upstream: 127.0.0.1 with no key): the server listens beyond this PC unless the config
-# or --host says otherwise, so it gets a placeholder key that the printed line says where to change.
+# or --host says otherwise, so it gets a per-process key that the printed line shows to the local user.
 DEFAULT_HOST = "0.0.0.0"
-DEFAULT_API_KEY = "sk-123456"
+LEGACY_PUBLIC_API_KEY = "sk-123456"
 QUEUE_BEAT_S = 10.0         # a request waiting for the single turn sends a keep-alive this often (#1619)
 KEEPALIVE_S = 10.0          # a held-back tool argument leaves the stream quiet: ping at least this often
 CTX_SLACK = 8               # `strata --serve` rejects prompt + max_new + 8 > context: keep the same margin here
@@ -650,7 +651,7 @@ def narrate_start(log_path: str, offset: int, args: list, done: threading.Event,
                 if "PLE on" in line or "expert arena:" in line or "experts via mmap" in line:   # #505: mapped
                     say("arena", f"[strata] {loading}\n"
                                  "         YOUR PC CAN BE SLOW OR STOP RESPONDING FOR 1-3 MINUTES NOW - this is normal.\n"
-                                 "         Please wait and don't close this window; the browser opens when it is ready.")
+                                 "         Please wait and don't close this window; the server says when it is ready.")
                 elif " loaded " in line and "GiB at" in line:
                     say("loaded", "[strata] experts loaded: " + line.split(" loaded ", 1)[1].strip() +
                         f" ({time.time() - t0:.0f} s so far)")
@@ -2332,6 +2333,8 @@ class Vision:
         self.video_capable = False
         self.video_probed = False
         self.spawn = (args, log, env)                   # to start it again after an unload
+        self._identity_paths = [absolute(cfg["exe"]), absolute(cfg["mmproj"]), absolute(cfg["model"])]
+        self.video_identity = self._video_identity(self._identity_paths, args)
         self.proc = None
         self.stopped = True
         self.lock = threading.Lock()
@@ -2379,8 +2382,25 @@ class Vision:
 
         self.video_capable = "video=SVF2" in line.split()
         self.video_probed = True
-        # A new resident encoder is a new identity, even if weights were replaced in place.
-        self.video_identity = uuid.uuid4().hex
+        self.video_identity = self._video_identity(self._identity_paths, self.spawn[0])
+
+    @staticmethod
+    def _video_identity(paths, args) -> str:
+        """A stable identity for an encoder build and its weights.
+
+        Elastic unload/restart must not invalidate every video cache entry.  File size and nanosecond mtime identify
+        the mounted executable, mmproj and model; the spawn arguments and cache format cover configuration changes.
+        """
+        files = []
+        for path in paths:
+            real = os.path.abspath(path)
+            try:
+                st = os.stat(real)
+                files.append({"path": real, "size": st.st_size, "mtime_ns": st.st_mtime_ns})
+            except OSError:
+                files.append({"path": real, "missing": True})
+        material = {"format": "SVF2-SVE1-layout-v1", "args": args, "files": files}
+        return hashlib.sha256(json.dumps(material, sort_keys=True).encode()).hexdigest()
 
     def encode_video(self, packet, output, budget):
         """Encode one packet; the caller owns the output (and any cache publication)."""
@@ -2529,8 +2549,7 @@ class Vision:
         return proc is not None and not self.stopped and self._proc_poll(proc) is None
 
     def video_available(self) -> bool:
-        on_demand = getattr(self, "elastic", False) and not getattr(self, "video_probed", False)
-        return bool(self.video_policy and (self.video_capable or on_demand)
+        return bool(self.video_policy and self.video_capable
                     and (self.alive() or getattr(self, "elastic", False))
                     and all(shutil.which(self.video_policy[k]) for k in ("ffmpeg", "ffprobe")))
 
@@ -3346,6 +3365,8 @@ class Service:
         self.last_request_at = None                      # when a request last started or finished
         self.started_at = time.time()
         self.status_lock = threading.Lock()
+        self._control_cv = threading.Condition(self.status_lock)
+        self._control_active = False
         # Video preparation and generation share one lifecycle lease, even while
         # the public queue counter hands off to _run. Guard both fields with status_lock.
         self._video_requests = 0
@@ -3574,28 +3595,44 @@ class Service:
         if not self.fifo.acquire(blocking=False):
             return "busy"
         try:
-            with self.status_lock:
-                if self._vision_requests or self._video_requests or self.status.get("busy"):
-                    return "busy"
-            held = self.vision_held
-            before = self._vision_resource_snapshot(getattr(v, "proc", None))
-            started = time.monotonic()
-            v.unload()
-            elapsed = time.monotonic() - started
-            after = self._vision_resource_snapshot()
-            if held and hasattr(self.engine, "vram") and self.loaded():
-                out = self.engine.vram(self._engine_reserve())
-                print(f"[strata] vision: the encoder stopped after {v.elastic_idle_s:g} s without visual work; "
-                      f"the expert cache took its VRAM back ({out.get('expert_cache_mib')} of "
-                      f"{out.get('expert_cache_full_mib')} MiB)", flush=True)
-            else:
-                print(f"[strata] vision: the encoder stopped after {v.elastic_idle_s:g} s without visual work",
-                      flush=True)
-            self.vision_held = False
-            with self.status_lock:
-                self._vision_last_unload = {
-                    "at": time.time(), "elapsed_s": round(elapsed, 3), "process_exited": True,
-                    "scope": "whole_devices_and_system", "before": before, "after": after}
+            try:
+                with self._engine_control(wait=False):
+                    with self.status_lock:
+                        if self._vision_requests or self._video_requests or self.status.get("busy"):
+                            return "busy"
+                    held = self.vision_held
+                    before = self._vision_resource_snapshot(getattr(v, "proc", None))
+                    started = time.monotonic()
+                    v.unload()
+                    elapsed = time.monotonic() - started
+                    after = self._vision_resource_snapshot()
+                    reclaimed, reclaim_error = False, None
+                    if held and hasattr(self.engine, "vram") and self.loaded():
+                        try:
+                            out = self.engine.vram(self._engine_reserve())
+                            reclaimed = True
+                            print(f"[strata] vision: the encoder stopped after {v.elastic_idle_s:g} s without "
+                                  f"visual work; the expert cache took its VRAM back "
+                                  f"({out.get('expert_cache_mib')} of {out.get('expert_cache_full_mib')} MiB)",
+                                  flush=True)
+                        except Exception as e:  # noqa: BLE001 - the encoder has stopped; release its logical share
+                            reclaim_error = str(e)
+                            print(f"[strata] vision: the encoder stopped after {v.elastic_idle_s:g} s without "
+                                  f"visual work, but the expert cache did not take the share back ({e})",
+                                  flush=True)
+                    else:
+                        print(f"[strata] vision: the encoder stopped after {v.elastic_idle_s:g} s without visual "
+                              "work", flush=True)
+                    # The process is gone even if the cache could not grow.  Keeping this true would make a later
+                    # POST /v1/vram reserve room for an encoder that no longer exists.
+                    self.vision_held = False
+                    with self.status_lock:
+                        self._vision_last_unload = {
+                            "at": time.time(), "elapsed_s": round(elapsed, 3), "process_exited": True,
+                            "scope": "whole_devices_and_system", "before": before, "after": after,
+                            "vram_reclaimed": reclaimed, "vram_error": reclaim_error}
+            except ModelBusy:
+                return "busy"
             def value(n):
                 return "unavailable" if n is None else f"{n:.1f}"
             def change(a, b):
@@ -3742,26 +3779,20 @@ class Service:
             raise ValueError("this engine cannot resize its VRAM use")
         if not self.fifo.acquire(timeout=self.vram_wait_s):
             raise ModelBusy("a request is still running; try again when it has finished")
-        # parallel requests do not hold the fifo: the engine's control lines (a prompt being admitted) are taken too,
-        # and the engine refuses a resize while a slot decodes
-        ctl = getattr(self.engine, "ctl", None) if getattr(self.engine, "batch", 0) else None
-        if ctl is not None and not ctl.acquire(timeout=self.vram_wait_s):
-            self.fifo.release()
-            raise ModelBusy("a request is still running; try again when it has finished")
         try:
-            if not self.loaded():
+            with self._engine_control(timeout=self.vram_wait_s):
+                if not self.loaded():
+                    self.vram_reserve, self.vram_reserve_asked = reserve_mib, True
+                    return {"status": "not loaded", "reserve_mib": reserve_mib,
+                            "note": "applied when the model loads"}
+                # an elastic encoder that runs keeps its VRAM on top of the asked reserve
+                out = self.engine.vram((reserve_mib or 0) + self.vision.elastic_mib if self.vision_held else reserve_mib)
                 self.vram_reserve, self.vram_reserve_asked = reserve_mib, True
-                return {"status": "not loaded", "reserve_mib": reserve_mib,
-                        "note": "applied when the model loads"}
-            # an elastic encoder that runs keeps its VRAM on top of the asked reserve
-            out = self.engine.vram((reserve_mib or 0) + self.vision.elastic_mib if self.vision_held else reserve_mib)
-            self.vram_reserve, self.vram_reserve_asked = reserve_mib, True
-            print(f"[strata] VRAM: {out.get('vram_free_mib')} MiB free, expert cache {out.get('expert_cache_mib')} of "
-                  f"{out.get('expert_cache_full_mib')} MiB ({out.get('expert_slots')} experts)", flush=True)
-            return {"status": "ok", **out}
+                print(f"[strata] VRAM: {out.get('vram_free_mib')} MiB free, expert cache "
+                      f"{out.get('expert_cache_mib')} of {out.get('expert_cache_full_mib')} MiB "
+                      f"({out.get('expert_slots')} experts)", flush=True)
+                return {"status": "ok", **out}
         finally:
-            if ctl is not None:
-                ctl.release()
             self.fifo.release()
 
     def _say_died(self, e: Exception) -> None:
@@ -3771,7 +3802,7 @@ class Service:
         print(f"[strata] {e}. {note} The next request starts the engine again."
               f"{' Its log: ' + log if log else ''}", flush=True)
 
-    def load(self):
+    def load(self, cancel=None):
         """POST /load and every generation request: start the engine now if it is unloaded (raises GpuBusy)."""
         # a request is on its way: the idle thread must not unload between this and the request's own start
         self.last_request_at = time.time()
@@ -3793,7 +3824,8 @@ class Service:
                         trace["queue_s"] += round(loading - waiting, 3)
                         trace["state"] = "loading"
                 try:
-                    self.ensure_loaded()
+                    with self._engine_control(cancel):
+                        self.ensure_loaded()
                 finally:
                     if trace is not None:
                         with self.status_lock:
@@ -3868,7 +3900,7 @@ class Service:
         self._mark_vision_activity()
 
     @contextlib.contextmanager
-    def image_activity(self):
+    def image_activity(self, cancel=None):
         # Register before waiting on fifo; unload uses the same status lock.
         with self.status_lock:
             self._vision_requests += 1
@@ -3877,7 +3909,8 @@ class Service:
             # cached files have been copied to a request-owned embedding file.
             with self._image_prepare_lock:
                 with self.fifo:
-                    self.ensure_loaded()
+                    with self._engine_control(cancel):
+                        self.ensure_loaded()
                 yield
         finally:
             with self.status_lock:
@@ -4226,6 +4259,84 @@ class Service:
         finally:
             self.fifo.release()
 
+    @contextlib.contextmanager
+    def _engine_control(self, cancel=None, timeout: float | None = None, *, wait: bool = True):
+        """Keep batch slots idle for a visual or model-control operation.
+
+        With parallel requests the FIFO alone does not stop new admissions or wait for decoding slots.  A service-level
+        gate first stops new requests from registering; existing requests finish without this context holding the
+        engine's control lines.  Only then are the lines taken for the body.  Without batching this is a no-op.
+        """
+        ctl = getattr(self.engine, "ctl", None) if getattr(self.engine, "batch", 0) else None
+        if ctl is None:
+            yield
+            return
+        deadline = time.monotonic() + timeout if timeout is not None else None
+
+        def unavailable() -> ModelBusy:
+            return ModelBusy("the engine's batch slots are using the GPU; try again when they are idle")
+
+        def expired() -> bool:
+            return deadline is not None and time.monotonic() >= deadline
+
+        acquired = False
+        try:
+            with self._control_cv:
+                while self._control_active:
+                    if cancel is not None and cancel.is_set():
+                        raise ClientGone()
+                    if expired():
+                        raise unavailable()
+                    if not wait:
+                        raise unavailable()
+                    remaining = max(0.0, deadline - time.monotonic()) if deadline is not None else 0.1
+                    self._control_cv.wait(min(0.1, remaining) if remaining else 0.1)
+                self._control_active = True
+            while True:
+                if cancel is not None and cancel.is_set():
+                    raise ClientGone()
+                if expired():
+                    raise unavailable()
+                with self.status_lock:
+                    live = bool(self.live_reqs)
+                if not live:
+                    break
+                if not wait:
+                    raise unavailable()
+                time.sleep(0.05)
+            while not acquired:
+                if cancel is not None and cancel.is_set():
+                    raise ClientGone()
+                if expired():
+                    raise unavailable()
+                remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+                acquired = ctl.acquire(timeout=0 if not wait else (0.1 if remaining is None
+                                                                   else min(0.1, remaining)))
+                if not acquired and not wait:
+                    raise unavailable()
+            yield
+        finally:
+            if acquired:
+                ctl.release()
+            with self._control_cv:
+                self._control_active = False
+                self._control_cv.notify_all()
+
+    def _register_parallel_request(self, st: dict, rate, cancel, fields: dict) -> None:
+        """Register a running batch request unless an exclusive engine-control operation is active."""
+        with self._control_cv:
+            while self._control_active:
+                if cancel.is_set():
+                    self.status["queued"] -= 1
+                    raise ClientGone()
+                self._control_cv.wait(0.1)
+            self.status["queued"] -= 1
+            st.update(fields)
+            self.live_reqs[id(st)] = (st, rate)
+            self.status.update(st)
+            self.last_request_at = time.time()
+            rate.clear()
+
     def _note_unreadable_tool_images(self, messages, cancel=None):
         """A picture a tool returned (Claude Code's Read of an image file) that this server cannot read - it has no
         image encoder, or the encoder refuses that picture - becomes a short note in its place instead of a 400.
@@ -4249,11 +4360,12 @@ class Service:
                         if src.startswith(("http://", "https://")):
                             src = fetched[item["source"]] = Vision.download(src)   # outside the FIFO, as in prepare()
                         with self._turn(cancel):  # the encoder takes its turn with the requests (see below)
-                            self.ensure_vision_loaded()
-                            try:
-                                self.vision.encode(src)
-                            finally:
-                                self._mark_vision_activity()
+                            with self._engine_control(cancel):
+                                self.ensure_vision_loaded()
+                                try:
+                                    self.vision.encode(src)
+                                finally:
+                                    self._mark_vision_activity()
                     except (ValueError, OSError) as e:
                         why = str(e)
                 if why is not None:
@@ -4267,7 +4379,7 @@ class Service:
 
 
     def prepare(self, messages, tools, kwargs, max_new=None, force=None, req=None, cancel=None):
-        activity = (self.image_activity()
+        activity = (self.image_activity(cancel)
                     if self.vision is not None and getattr(self.vision, "elastic", False) and images_of(messages)
                     else contextlib.nullcontext())
         with activity:
@@ -4311,12 +4423,13 @@ class Service:
             # "reading the prompt" with CPU and GPU busy, for good (reproduced).  So encoding takes its turn in the
             # same FIFO as the requests.
             with self._turn(cancel):
-                self.ensure_vision_loaded()
-                try:
-                    encoded = (self.vision.encode_all(images, cancel) if hasattr(self.vision, "encode_all")
-                               else [self.vision.encode(src) for src in images])
-                finally:
-                    self._mark_vision_activity()
+                with self._engine_control(cancel):
+                    self.ensure_vision_loaded()
+                    try:
+                        encoded = (self.vision.encode_all(images, cancel) if hasattr(self.vision, "encode_all")
+                                   else [self.vision.encode(src) for src in images])
+                    finally:
+                        self._mark_vision_activity()
             # one <|image_pad|> per image -> one per image token.  Only the markers the template writes for an image
             # (right after <|vision_start|>) are images: the same text inside a message (an agent reading these docs,
             # #150) is kept as plain text, or it took an image's place and the counts no longer matched.
@@ -4414,21 +4527,25 @@ class Service:
                 with contextlib.ExitStack() as turn:
                     with budget.stage("encode_queue"):
                         turn.enter_context(video_api.acquire(self.fifo, budget))
-                    with budget.stage("load"):
-                        self.ensure_vision_loaded(budget)
-                    if not self.vision.video_capable:
-                        raise video_api.VideoError("strata-vision does not advertise the required SVF2 video profile")
-                    if cached is None:
-                        with budget.stage("encode"):
-                            output, _, layout = self.vision.encode_video(packet, Path(directory) / "video.sve", budget)
-                    else:
+                    with self._engine_control(budget.cancel):
+                        with budget.stage("load"):
+                            self.ensure_vision_loaded(budget)
+                        if not self.vision.video_capable:
+                            raise video_api.VideoError(
+                                "strata-vision does not advertise the required SVF2 video profile")
+                        if cached is None:
+                            with budget.stage("encode"):
+                                output, _, layout = self.vision.encode_video(
+                                    packet, Path(directory) / "video.sve", budget)
+                    if cached is not None:
                         artifact, layout, identity = cached
                         if identity != self.vision.video_identity:
                             raise video_api.VideoError("video encoder changed; retry the request")
                         try:
                             video_api.validate_artifact(artifact, layout, budget.settings)
                         except (ValueError, OSError):
-                            raise video_store.StoreError("video_cache_corrupt", "invalid cached video artifact", 503) from None
+                            raise video_store.StoreError(
+                                "video_cache_corrupt", "invalid cached video artifact", 503) from None
                         output = Path(directory) / "video.sve"
                         with budget.stage("artifact_copy"), Path(artifact).open("rb") as source, output.open("wb") as target:
                             while chunk := source.read(65536):
@@ -4504,18 +4621,20 @@ class Service:
                             with contextlib.ExitStack() as turn:
                                 with own_budget.stage("encode_queue"):
                                     turn.enter_context(video_api.acquire(self.fifo, own_budget))
-                                with own_budget.stage("load"):
-                                    self.ensure_vision_loaded(own_budget)
-                                if not vision.video_capable:
-                                    raise video_api.VideoError(
-                                        "strata-vision does not advertise the required SVF2 video profile")
-                                if identity != vision.video_identity:
-                                    raise video_api.VideoError("video encoder changed; retry the request")
-                                stage = "encode"
-                                encoding = time.monotonic()
-                                with own_budget.stage("encode"):
-                                    output, _, layout = vision.encode_video(packet, Path(directory) / "video.sve", own_budget)
-                                encoded = time.monotonic()
+                                with self._engine_control(own_budget.cancel):
+                                    with own_budget.stage("load"):
+                                        self.ensure_vision_loaded(own_budget)
+                                    if not vision.video_capable:
+                                        raise video_api.VideoError(
+                                            "strata-vision does not advertise the required SVF2 video profile")
+                                    if identity != vision.video_identity:
+                                        raise video_api.VideoError("video encoder changed; retry the request")
+                                    stage = "encode"
+                                    encoding = time.monotonic()
+                                    with own_budget.stage("encode"):
+                                        output, _, layout = vision.encode_video(
+                                            packet, Path(directory) / "video.sve", own_budget)
+                                    encoded = time.monotonic()
                             video_api.validate_artifact(output, layout, settings)
                             own_budget.check()
                             with own_budget.stage("artifact_store"):
@@ -4804,23 +4923,23 @@ class Service:
                             self.ensure_loaded()
                         elif not (self.loaded() and not self._vision_down()):
                             with self.fifo:
-                                self.ensure_loaded()
+                                with self._engine_control(cancel):
+                                    self.ensure_loaded()
                     except BaseException:
                         if par:
                             with self.status_lock:
                                 self.status["queued"] -= 1
                         raise
-                    with self.status_lock:
-                        if par:
-                            self.status["queued"] -= 1
-                        st.update(busy=True, phase="reading the prompt", prompt_tokens=len(ids),
+                    fields = dict(busy=True, phase="reading the prompt", prompt_tokens=len(ids),
                                   generated=0, started=time.time(), first_token=None, tool=None, tail="",
                                   max_tokens=max_new, reasoning_recoveries=0, thinking_budget=budget)
-                        if par:
-                            self.live_reqs[id(st)] = (st, rate)
-                            self.status.update(st)
-                        self.last_request_at = time.time()
-                        rate.clear()                    # the previous request's samples must not leak into this one
+                    if par:
+                        self._register_parallel_request(st, rate, cancel, fields)
+                    else:
+                        with self.status_lock:
+                            st.update(fields)
+                            self.last_request_at = time.time()
+                            rate.clear()
                     before = getattr(self.engine, "last", None)
                     last_print = time.time()
                     prompt, thought = ids, 0            # thought: the reasoning tokens so far (the budget's count)
@@ -6152,6 +6271,8 @@ def make_handler(svc: Service):
                 try:
                     svc.load()
                     self._json(200, {"status": "loaded"})
+                except ModelBusy as e:
+                    self._json(409, {"error": {"type": "model_busy", "message": str(e)}})
                 except (GpuBusy, EngineDied, EngineStuck) as e:
                     ra = getattr(e, "retry_after", None)       # #1997 / #1994: a refusal that is worth retrying
                     self._json(503, {"error": {"type": "server_error", "message": str(e)}},
@@ -6184,7 +6305,8 @@ def make_handler(svc: Service):
                             with svc.status_lock:
                                 if svc.status.get("busy") or svc.status.get("queued"):
                                     raise ModelBusy("a request is running or queued")
-                            svc.ensure_loaded()
+                            with svc._engine_control():
+                                svc.ensure_loaded()
                             svc.last_request_at = time.time()
                         finally:
                             svc.fifo.release()
@@ -6834,6 +6956,12 @@ def make_handler(svc: Service):
             except ConnectionError:
                 cancel.set()
                 self._note(outcome="disconnected")
+            except ModelBusy as e:
+                cancel.set()
+                if getattr(self, "video_stream_started", False):
+                    self._responses_failed(asm, str(e), "model_busy", send)
+                else:
+                    self._json(409, responses_error_body(str(e), "server_error", code="model_busy"))
             except Exception as e:
                 if getattr(self, "video_stage", None) == "load" and isinstance(e, video_api.VideoError):
                     code = "video_load_cancelled" if cancel.is_set() else "video_load_timeout"
@@ -6930,7 +7058,10 @@ def make_handler(svc: Service):
                         with video_budget.stage("load_queue"):
                             turn.enter_context(video_api.acquire(svc.fifo, video_budget))
                         with video_budget.stage("load"):
-                            svc.ensure_vision_loaded(video_budget)
+                            with svc._engine_control(video_budget.cancel):
+                                svc.ensure_vision_loaded(video_budget)
+                except (ModelBusy, ClientGone):
+                    raise
                 except video_api.VideoError:
                     raise
                 except Exception as e:
@@ -6938,7 +7069,7 @@ def make_handler(svc: Service):
                 self.video_stage = "prepare"
                 svc.last_request_at = time.time()
             else:
-                svc.load()
+                svc.load(cancel)
             # #924 (opt-in): a Codex compaction request is rendered with its conversation's tools, so its prompt
             # starts as the cached one did; the parser and the response keep the request's own tools
             shown = responses_api.prompt_tools(req, tools) if svc.codex_compaction_cache else tools
@@ -7266,6 +7397,16 @@ def api_key_of(value):
     if key and not key_list(key):
         raise ValueError("an API key was given but it is empty")
     return key.strip()
+
+
+def without_legacy_public_key(value):
+    """Drop the old public placeholder from a string, comma-separated string, or list of configured keys."""
+    if isinstance(value, list):
+        return [key for key in value if key != LEGACY_PUBLIC_API_KEY]
+    if isinstance(value, str) and "," in value:
+        return ",".join(key.strip() for key in value.split(",")
+                        if key.strip() and key.strip() != LEGACY_PUBLIC_API_KEY)
+    return "" if value == LEGACY_PUBLIC_API_KEY else value
 
 
 def key_matches(given: str, key) -> bool:
@@ -7630,7 +7771,7 @@ def main() -> int:
                                      "written by setup.py")
     ap.add_argument("--host", default=None,
                     help="the address to listen on: 0.0.0.0 = also other devices on your network (the default here, "
-                         "with the default API key), 127.0.0.1 = this PC only; also \"host\" in the config")
+                         "with a generated API key), 127.0.0.1 = this PC only; also \"host\" in the config")
     ap.add_argument("--script", action="append",
                     help="the mock engine's answer (default: a short greeting); given more than once, requests get "
                          "them in turn and the last one repeats")
@@ -7826,14 +7967,25 @@ def main() -> int:
     except ValueError as e:
         print(f'[strata] {e}: set a key, or leave --api-key / STRATA_API_KEY / "api_key" out', file=sys.stderr)
         return 2
-    if not svc.api_key and "api_key" in cfg:             # #569: written, but empty: the server has none (a warning, not a stop)
+    cleaned_key = without_legacy_public_key(svc.api_key)
+    if cleaned_key != svc.api_key:
+        if cleaned_key:
+            svc.api_key = cleaned_key
+            print("[strata] removed the old public API key and kept the other configured keys", file=sys.stderr,
+                  flush=True)
+        else:
+            svc.api_key = "sk-" + secrets.token_urlsafe(24)
+            print(f'[strata] rotated the old public key: this process now uses "{svc.api_key}". Set "api_key" in the '
+                  "config (or --api-key / $STRATA_API_KEY) to keep your own key across starts",
+                  file=sys.stderr, flush=True)
+    elif not svc.api_key and a.host not in LOOPBACK_NAMES:  # this fork: 0.0.0.0 is the default, so a key is always set
+        svc.api_key = "sk-" + secrets.token_urlsafe(24)
+        print(f'[strata] no API key was set: listening on {a.host} with this process\'s generated key '
+              f'"{svc.api_key}". Set "api_key" in the config (or --api-key / $STRATA_API_KEY) to keep one across '
+              "starts; the chat page's API key box takes it once", file=sys.stderr, flush=True)
+    elif not svc.api_key and "api_key" in cfg:           # #569: written empty on a loopback server: a warning, not a stop
         print("[strata] the api_key in the config is empty: this server has no API key (anyone who can reach it can "
               "use it); set one, or leave api_key out", file=sys.stderr, flush=True)
-    if not svc.api_key and a.host not in LOOPBACK_NAMES:  # this fork: 0.0.0.0 is the default, so a key is always set
-        svc.api_key = DEFAULT_API_KEY
-        print(f'[strata] no API key was set: listening on {a.host} with the default "{DEFAULT_API_KEY}". '
-              'Change "api_key" in the config file (or --api-key / $STRATA_API_KEY); the chat page\'s API key '
-              "box takes it once", file=sys.stderr, flush=True)
     files_config = cfg.get("video_files")
     if files_config is not None:
         if not isinstance(files_config, dict) or not isinstance(files_config.get("enabled", False), bool):
