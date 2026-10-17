@@ -46,7 +46,7 @@ def policy(config):
     result = {**DEFAULTS, **{k: v for k, v in config.items() if k != "enabled"}}
     ceilings = {"max_bytes": 8 << 30, "max_files": 512,
                 "cache_max_bytes": 8 << 30, "cache_max_entries": 512,
-                "cache_max_entry_bytes": 1 << 30, "cache_max_workers": 2}
+                "cache_max_entry_bytes": 1 << 30, "cache_max_workers": 1}
     for key, ceiling in ceilings.items():
         value = result[key]
         if isinstance(value, bool) or not isinstance(value, int) or not 0 < value <= ceiling:

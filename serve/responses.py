@@ -288,6 +288,8 @@ def request_tools(req: dict):
              and isinstance(item.get("tools"), list)
              for t in item["tools"]]
     given = list(given) + extra
+    plain_tool_search = any(isinstance(tool, dict) and tool.get("type") == "function"
+                            and tool.get("name") == CLIENT_TOOL_SEARCH for tool in given)
 
     def add(tool, param, namespace=None, ns_description=""):
         kind = tool.get("type")
@@ -325,10 +327,11 @@ def request_tools(req: dict):
         elif kind == "tool_search":
             # Codex's client-side tool discovery (#1917): no host can run it, so the model gets an ordinary function
             # the client answers, and the call goes back as a `tool_search_call`. A search some other host runs is
-            # left out, like the other hosted tools; a second declaration of the same tool adds nothing.
+            # left out, like the other hosted tools; a second declaration adds nothing, and a plain function of the same
+            # name wins regardless of declaration order.
             if tool.get("execution") not in (None, "client"):
                 skipped.append(kind)
-            elif CLIENT_TOOL_SEARCH not in names:
+            elif not plain_tool_search and CLIENT_TOOL_SEARCH not in names:
                 add(tool, param)
         elif kind == "namespace":
             for j, member in enumerate(tool.get("tools") or []):

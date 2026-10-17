@@ -5,6 +5,9 @@
 
 Endpoints: POST /v1/chat/completions (OpenAI, stream and non-stream), POST /v1/messages (Anthropic, stream and
 non-stream), GET /v1/models, GET /models, GET /props, GET /slots, GET /health, GET /mcp. One sequence at a time behind a FIFO (plan: one resident sequence).
+Image generation (optional, when the config has an "images" section): POST /v1/images/generations (OpenAI's shape,
+plus seed and steps) runs stable-diffusion.cpp's sd-cli for Qwen-Image-2.1-Turbo, one job at a time on the GPU the
+text engine uses (serve/images.py).
 Tools from MCP servers (serve/mcp.py, `"mcp_servers"` in the config or --mcp-config) are offered only to requests that
 ask for them with `"strata_mcp": true` - the web app does; other clients see exactly the API they always saw.
 Images (optional, when the config has a "vision" entry): OpenAI image_url parts and Anthropic image blocks (base64
@@ -33,6 +36,7 @@ import math
 import os
 import queue
 import re
+import secrets
 import select
 import signal
 import socket
@@ -66,6 +70,7 @@ from serve.winjob import contain  # noqa: E402
 from serve.structured import StructuredOutputError, prepare_format, validated_json  # noqa: E402
 from serve import responses as responses_api  # noqa: E402
 from serve.responses import ResponsesError, error_body as responses_error_body  # noqa: E402
+from serve import images as images_api  # noqa: E402
 
 IM_END = "<|im_end|>"
 IMAGE_PAD = "<|image_pad|>"
@@ -145,6 +150,7 @@ VISION_START = "<|vision_start|>"
 # broken state that answers one token forever (an issue saw 36,689 tokens of "!"). The config's "repeat_stop_tokens"
 # sets it; 0 turns it off.
 REPEAT_STOP_TOKENS = 256
+ANSWER_ROOM_MIN_CAP = 1024    # 0.1.45: from this max_tokens on, thinking without a budget is closed early enough to leave room to answer
 ANSWER_RESERVE_MIN = 512      # #984: the tokens kept for the answer when a thinking budget is cut down to fit max_tokens
 # #123: what closes the thinking when it reaches reasoning_budget_tokens (the model's own end-of-thinking tag after it)
 # #1053 (opt-in "reasoning_close_retry": true): a reply that ends on its stop token still inside <think>, with no answer
@@ -210,9 +216,9 @@ def focused_recovery_prompt(tok, ids, generated):
 
 LOOPBACK_NAMES = ("localhost", "127.0.0.1", "::1")
 # This fork's own defaults (upstream: 127.0.0.1 with no key): the server listens beyond this PC unless the config
-# or --host says otherwise, so it gets a placeholder key that the printed line says where to change.
+# or --host says otherwise, so it gets a per-process key that the printed line shows to the local user.
 DEFAULT_HOST = "0.0.0.0"
-DEFAULT_API_KEY = "sk-123456"
+LEGACY_PUBLIC_API_KEY = "sk-123456"
 QUEUE_BEAT_S = 10.0         # a request waiting for the single turn sends a keep-alive this often (#1619)
 KEEPALIVE_S = 10.0          # a held-back tool argument leaves the stream quiet: ping at least this often
 CTX_SLACK = 8               # `strata --serve` rejects prompt + max_new + 8 > context: keep the same margin here
@@ -256,6 +262,15 @@ def _timeout_env(name: str, default: float) -> float | None:
 # still working is never ended by this, only reported once (the recommendation: engine_silence_s, or this variable).
 # STRATA_ENGINE_STALL_S overrides it (0 = off).  Needs psutil (setup installs it); without it nothing is ended.
 ENGINE_STALL_S = _timeout_env("STRATA_ENGINE_STALL_S", 90.0)
+# --batch: new requests take the control lines (one prompt read at a time) short prompts first: a prompt of at most
+# STRATA_ADMIT_SHORT_FIRST tokens goes before longer ones (opt-in; unset or 0: whoever gets the lock first), and a
+# longer one that waited STRATA_ADMIT_MAX_WAIT_S (default 30) counts as short.  A chat question then waits for the one
+# read in progress, not for every agent read that came before it.
+try:
+    ADMIT_SHORT_FIRST = max(0, int(os.environ.get("STRATA_ADMIT_SHORT_FIRST") or 0))
+except ValueError:
+    ADMIT_SHORT_FIRST = 0
+ADMIT_MAX_WAIT_S = _timeout_env("STRATA_ADMIT_MAX_WAIT_S", 30.0) or 0.0
 STALL_CPU_EPS_S = 0.5       # CPU seconds the engine may use in the whole stall window and still count as frozen
 STALL_IO_EPS_B = 1 << 20    # bytes read or written in that window
 
@@ -437,6 +452,123 @@ def start_log_tail(log: str | None, offset: int, n: int = 20) -> str:
     return "\nthe engine log's last lines:\n" + "\n".join("  " + x for x in lines)
 
 
+# Windows NTSTATUS exit codes of a process the system ended (a crash, not an error the engine reported)
+_WIN_CRASH = {0xC000001D: "illegal instruction (the CPU lacks an instruction the program uses)",
+              0xC0000005: "access violation", 0xC0000409: "stack buffer overrun / fast-fail",
+              0xC0000135: "a DLL the program needs was not found", 0xC0000139: "entry point not found in a DLL",
+              0xC0000142: "a DLL failed to initialize", 0xC000007B: "bad image (32-bit / 64-bit mix-up)",
+              0xC00000FD: "stack overflow", 0xC0000094: "integer division by zero", 0xC0000096: "privileged instruction"}
+
+
+def engine_exit_words(rc: int | None) -> str:
+    """What a process's exit status says, in words: "killed by signal 4 (SIGILL, Illegal instruction)" (a negative status
+    on Linux / macOS), a Windows NTSTATUS crash code, or "exit code N".  "" when there is no status."""
+    if rc is None:
+        return ""
+    if rc < 0 and os.name != "nt":
+        try:
+            sig = signal.Signals(-rc)
+            return f"killed by signal {-rc} ({sig.name}, {signal.strsignal(sig) or sig.name})"
+        except (ValueError, AttributeError):
+            return f"killed by signal {-rc}"
+    code = rc & 0xFFFFFFFF
+    if code in _WIN_CRASH:
+        return f"exit code 0x{code:08X}: {_WIN_CRASH[code]}"
+    if 0xC0000000 <= code < 0xD0000000:
+        return f"exit code 0x{code:08X} (a system error status)"
+    return f"exit code {rc}"
+
+
+def engine_crashed(rc: int | None) -> bool:
+    """True when the engine process was ended by the system (an illegal instruction, a bad memory access, the
+    out-of-memory killer, a missing DLL ...) rather than leaving by itself: nothing a second try fixes."""
+    if rc is None:
+        return False
+    if rc < 0 and os.name != "nt":
+        return -rc in {int(getattr(signal, n)) for n in ("SIGILL", "SIGSEGV", "SIGBUS", "SIGFPE", "SIGKILL")
+                       if hasattr(signal, n)}
+    return 0xC0000000 <= (rc & 0xFFFFFFFF) < 0xD0000000      # an NTSTATUS error code
+
+
+def cpu_isa_words() -> tuple:
+    """(text, missing): the CPU's model and which of AVX / AVX2 / FMA / F16C it reports (Linux: /proc/cpuinfo), and the
+    ones of those it lacks.  ("", []) where it cannot be read."""
+    try:
+        text = Path("/proc/cpuinfo").read_text(errors="replace")
+    except OSError:
+        return "", []
+    model = next((x.split(":", 1)[1].strip() for x in text.splitlines() if x.lower().startswith("model name")), "")
+    flags = next((x.split(":", 1)[1].split() for x in text.splitlines() if x.lower().startswith("flags")), [])
+    have = ", ".join(f"{f} {'yes' if f in flags else 'NO'}" for f in ("avx", "avx2", "fma", "f16c", "avx512f"))
+    missing = [f for f in ("avx", "avx2", "fma", "f16c") if f not in flags]
+    return f"{model or 'this CPU'} ({have})", missing
+
+
+def start_exit_note(rc: int | None) -> str:
+    """The sentence the start error carries about how the engine process ended (the engine log is silent when the
+    system ends it): "" without a status, else a line, with the CPU's AVX flags after an illegal instruction."""
+    words = engine_exit_words(rc)
+    if not words:
+        return ""
+    note = f"\nthe engine process ended: {words}"
+    if rc is not None and ((rc < 0 and os.name != "nt" and -rc == int(getattr(signal, "SIGILL", 4))) or
+                           (rc & 0xFFFFFFFF) == 0xC000001D):
+        isa, missing = cpu_isa_words()
+        note += "\n  An illegal instruction: the engine ran an instruction this CPU cannot execute"
+        if isa and missing:
+            note += f" ({', '.join(m.upper() for m in missing)} missing; {isa})"
+        elif isa:
+            note += f"; the CPU reports AVX, AVX2, FMA and F16C ({isa}), so this is a bug in the engine"
+        note += ".  Please report it with the CPU model (github.com/Niko1221/Strata/issues)."
+    return note
+
+
+def start_log_marks(log: str | None, offset: int) -> list:
+    """The GPU runtime failure texts (TRANSIENT_START_MARKS) this start wrote to the log: what lets a retry notice say the
+    GPU runtime failed.  [] when none, or no log."""
+    if not log:
+        return []
+    try:
+        with open(log, "rb") as f:
+            f.seek(offset)
+            text = f.read(64 * 1024).decode("utf-8", "replace")
+    except (OSError, ValueError):
+        return []
+    return [m for m in TRANSIENT_START_MARKS if m in text]
+
+
+# A start that ends at once with the GPU runtime's own failure and none of the engine's lines: on ROCm, a start right
+# after the previous engine exited can fail inside the runtime's device/queue set-up while the old process's queues are
+# still being torn down ("terminate called after throwing an instance of 'rocr::AMD::hsa_exception'", or an exit with
+# nothing in the log).  Such a start is tried again after a short wait (STRATA_START_RETRIES, default 3; 0: never).
+TRANSIENT_START_MARKS = ("hsa_exception", "HSA_STATUS_ERROR", "hsaKmt")
+START_RETRIES = max(0, int(os.environ.get("STRATA_START_RETRIES", "3") or 0))
+
+
+def transient_start_failure(log: str | None, offset: int, elapsed_s: float, rc: int | None = None) -> bool:
+    """True when the start that wrote the log from `offset` failed the transient way above: within 30 s, and its lines
+    are only the launcher's own "engine started" line plus (optionally) a GPU runtime failure.  An exit with no line
+    at all counts only when it was not the engine's own error exit (1: it said why on stdout)."""
+    if not log or elapsed_s > 30.0:
+        return False
+    try:
+        with open(log, "rb") as f:
+            f.seek(offset)
+            text = f.read(64 * 1024).decode("utf-8", "replace")
+    except (OSError, ValueError):
+        return False
+    lines = [x.strip() for x in text.splitlines() if x.strip()]
+    engine_lines = [x for x in lines if not x.startswith("[strata]")]
+    if any(m in text for m in TRANSIENT_START_MARKS):
+        return all(x.startswith("terminate called") or x.startswith("what()") or
+                   any(m in x for m in TRANSIENT_START_MARKS) for x in engine_lines)
+    # it exited without writing a single line of its own - but not when the system ended it (an illegal instruction, a
+    # bad memory access, the OOM killer, a missing DLL): that is a crash a second try repeats, and the retry notice
+    # must not call it a GPU runtime start (#2324: an old CPU's illegal instruction was retried 3 times as "GPU
+    # runtime" and the real reason never shown)
+    return not engine_lines and rc != 1 and not engine_crashed(rc)
+
+
 def echo_requests(log_path: str, offset: int) -> None:
     """STRATA_REQUEST_LINES=1: one stdout line per finished request, from the engine's own summary in its log.
 
@@ -519,7 +651,7 @@ def narrate_start(log_path: str, offset: int, args: list, done: threading.Event,
                 if "PLE on" in line or "expert arena:" in line or "experts via mmap" in line:   # #505: mapped
                     say("arena", f"[strata] {loading}\n"
                                  "         YOUR PC CAN BE SLOW OR STOP RESPONDING FOR 1-3 MINUTES NOW - this is normal.\n"
-                                 "         Please wait and don't close this window; the browser opens when it is ready.")
+                                 "         Please wait and don't close this window; the server says when it is ready.")
                 elif " loaded " in line and "GiB at" in line:
                     say("loaded", "[strata] experts loaded: " + line.split(" loaded ", 1)[1].strip() +
                         f" ({time.time() - t0:.0f} s so far)")
@@ -590,6 +722,19 @@ class ConvCacheLog:
         return dict(self.state)
 
 
+def conversation_slots(engine) -> int | None:
+    """How many conversations the engine's cache holds: its --conversation-cache-slots argument, which is known
+    before the engine has started (a lazy start has reported no INFO line yet), else the INFO line it reported."""
+    args = engine.spawn[1] if hasattr(engine, "spawn") else []
+    if "--conversation-cache-slots" in args[:-1]:
+        try:
+            return int(args[args.index("--conversation-cache-slots") + 1])
+        except ValueError:
+            pass
+    slots = (getattr(engine, "info", None) or {}).get("conversation_cache_slots")
+    return slots if isinstance(slots, int) else None
+
+
 def conversation_cache_view(info: dict, hist: list, totals: dict, parked: dict) -> dict:
     """#596: the Monitor's Conversation cache card: the parked conversations (the engine's opt-in
     --conversation-cache-mib: budget, slots, what its log says) and how much of the prompts the cache gave back."""
@@ -653,7 +798,7 @@ class StrataEngine:
             tl.last = value
 
     def __init__(self, exe: str, args: list[str], cwd: str | None = None, log: str | None = None,
-                 env: dict | None = None, lazy: bool = False, cpus: list[int] | None = None):
+                 env: dict | None = None, lazy: bool = False, cpus: list[int] | None = None, _attempt: int = 0):
         self.spawn = (exe, list(args), cwd, log, env, False, cpus)   # to start it again after it died (issue #27)
         self.session_save_reclaim = '--session-save-reclaim' in args
         paths = {k: v for k, v in zip(args, args[1:]) if k in ("--native", "--pack")}
@@ -700,6 +845,7 @@ class StrataEngine:
         pin = {}
         if cpus and hasattr(os, "sched_setaffinity"):    # replicas: this engine's own physical cores (serve/replicas.py)
             pin["preexec_fn"] = lambda: os.sched_setaffinity(0, cpus)
+        spawned_at = time.monotonic()
         self.proc = popen("the Strata engine", [exe, "--serve", *args], cwd=cwd, stdin=subprocess.PIPE,
                           stdout=subprocess.PIPE, stderr=self.log, text=True, encoding="utf-8", bufsize=1, env=env, **pin)
         contain(self.proc)                               # ends with the server, however it ends (Windows)
@@ -744,12 +890,34 @@ class StrataEngine:
                     self.log.close()
             except (OSError, subprocess.TimeoutExpired):
                 pass
+            if not timed_out and _attempt < START_RETRIES and \
+                    transient_start_failure(log, log_start, time.monotonic() - spawned_at, self.proc.returncode):
+                wait_s = 2.0 * (2 ** _attempt)              # 2, 4, 8 s: the previous process's GPU queues go away
+                exit_words = engine_exit_words(self.proc.returncode)
+                if start_log_marks(log, log_start):         # the runtime said so itself (hsa_exception ...)
+                    print(f"[strata] the engine stopped while the GPU runtime was starting (most often right after "
+                          f"another engine exited, whose GPU queues were still being released"
+                          f"{'; ' + exit_words if exit_words else ''}): starting it again in {wait_s:.0f} s "
+                          f"(try {_attempt + 2} of {START_RETRIES + 1})", flush=True)
+                else:                                       # an exit with nothing in the log: say only what is known
+                    print(f"[strata] the engine exited before it wrote anything to its log"
+                          f"{' (' + exit_words + ')' if exit_words else ''}; it may be a GPU runtime that was not "
+                          f"ready yet: starting it again in {wait_s:.0f} s (try {_attempt + 2} of {START_RETRIES + 1})",
+                          flush=True)
+                time.sleep(wait_s)
+                StrataEngine.__init__(self, exe, args, cwd, log, env, lazy, cpus, _attempt + 1)
+                return
             why = (f"the engine did not report READY within {ENGINE_READY_S:.0f} s" if timed_out else
                    "the engine exited before it was ready")
             # EngineDied, not bare RuntimeError: a request waiting on this load must end with a 503
             # through the request path's handler - a RuntimeError there left the turn with no answer (#1527)
-            raise EngineDied(why + (f" (see {log})" if log else "") +
-                             start_failure_hint(log, log_start) + start_log_tail(log, log_start))
+            note = "" if timed_out else start_exit_note(self.proc.returncode)
+            tail = start_log_tail(log, log_start)
+            lines = [x for x in tail.split("\n")[2:] if x.strip()]
+            if tail and lines and all(x.strip().startswith("[strata]") for x in lines):
+                tail += "\n  (those are the launcher's own lines: the engine itself wrote nothing)"
+            raise EngineDied(why + (f" (see {log})" if log else "") + note +
+                             start_failure_hint(log, log_start) + tail)
         self.known_ctx = self.max_context   # survives a failed restart: requests keep their limit and restart it
         # (from PR #41, midhatn) a locally built engine can sit next to another release's BUILD.json: engines that
         # report their own version (INFO engine=, 0.1.8+) win, the manifest stays the fallback for older ones
@@ -958,6 +1126,13 @@ class StrataEngine:
             self.last.update(prompt_read=int(f[14]))
         if len(f) >= 16:                                  # #588 (engine 0.1.39+): routed experts read over PCIe
             self.last.update(offloaded=int(f[15]))
+        for tok in f[16:]:                                # key=value fields after the positional ones (the prompt's
+            key, eq, value = tok.partition("=")           # first chunk and its streamed expert blobs)
+            if eq and key in ("chunk", "experts_streamed"):
+                try:
+                    self.last[key] = int(value)
+                except ValueError:
+                    pass
 
     def vram(self, reserve_mib: int | None, timeout: float = 120.0) -> dict:
         """#533: `VRAM <reserve_mib>` between requests (the caller holds the service's FIFO): the engine shrinks its
@@ -1035,6 +1210,10 @@ class StrataEngine:
                 v = tune.get(k)
                 if isinstance(v, (int, float)) and not isinstance(v, bool) and 0.0 <= float(v) <= 1.0:
                     keys += f" {k}={float(v)!r}"
+            # a layer split's prompt chunks (--prefill-pipe): 0 off, 1 evened out, > 1 the rig's b/a in tokens
+            v = tune.get("prefill_pipe")
+            if isinstance(v, (int, float)) and not isinstance(v, bool) and 0.0 <= float(v) <= 262144.0:
+                keys += f" pipe={float(v)!r}"
             # --aux-cpus for this request: 1 puts the engine's threads that are neither pool workers nor the host on the
             # spare CPUs, 0 leaves them where they were created (true/false or 1/0; the engine started without a spare CPU
             # ignores a 1).  Anything else is not sent.
@@ -1045,6 +1224,11 @@ class StrataEngine:
         # extends: no conversation checkpoint for it (#830).  It still reuses a cached prefix.  Absent = as before.
         if sampling.get("strata_checkpoint") is False:
             keys += " ckpt=0"
+        # #2228: the pictures' keys (hex, in prompt order): the engine matches a picture by them, not by its embeddings
+        ik = sampling.get("strata_img_keys")
+        if isinstance(ik, list) and ik and all(isinstance(k, str) and k and all(c in "0123456789abcdef" for c in k)
+                                               for k in ik):
+            keys += " img_keys=" + ",".join(ik)
         # "strata_prefix" (resolved by Service.resolve_prefix to {"tokens": N}): the first N prompt tokens are a shared
         # prefix - the engine pins the checkpoint there.  Absent or unresolved = as before.
         prefix = sampling.get("strata_prefix")
@@ -1070,10 +1254,11 @@ class StrataEngine:
         except (OSError, AttributeError):                # the pipe is gone (or a restart's close() took the process):
             raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
 
-    def _control(self, cancel, on_token, stop_when=None):
+    def _control(self, cancel, on_token, stop_when=None, on_quiet=None):
         """Reads the control lines of the request on them (GEN / BGEN), yielding None heartbeats.  Calls on_token(id)
         for each `T`; returns ("done", None) at DONE, or ("badm", continues) at BADM (after DONE).  `stop_when()`
-        true sends STOP once (the request is then read to its DONE)."""
+        true sends STOP once (the request is then read to its DONE).  `on_quiet()` runs whenever the engine has been
+        quiet for half a second: between two PP lines of a read whose chunks take longer than that."""
         stopped = False
         beat = time.monotonic()
         while True:
@@ -1085,6 +1270,8 @@ class StrataEngine:
                 if cancel.is_set() and not stopped:
                     self._send("STOP")
                     stopped = True
+                if on_quiet is not None:
+                    on_quiet()
                 if time.monotonic() - beat >= 10.0:
                     beat = time.monotonic()
                     yield None
@@ -1270,10 +1457,11 @@ class StrataEngine:
 
     YIELDS_MAX = 2   # #656: how often one request's prompt read gives way to a shorter waiting one
 
-    def _take_control(self, cancel, plen: int, after_epoch: int | None = None):
+    def _take_control(self, cancel, plen: int, after_epoch: int | None = None, new: bool = False):
         """Waits for the control lines (one prompt read at a time), yielding None heartbeats; False when cancelled.
-        `after_epoch`: a request whose read gave way lets the requests waiting then go first."""
-        entry = [plen]
+        `after_epoch`: a request whose read gave way lets the requests waiting then go first.
+        `new`: the request's first admission (STRATA_ADMIT_SHORT_FIRST orders only these)."""
+        entry = [plen, time.monotonic(), new]           # (length, arrival, ordered: STRATA_ADMIT_SHORT_FIRST)
         with self.slot_cv:
             self.waiting += 1
             self.wait_lens.append(entry)
@@ -1287,7 +1475,17 @@ class StrataEngine:
                     raise EngineDied("the engine stopped while this request waited; it was not sent")
                 with self.slot_cv:
                     turn = after_epoch is None or self.ctl_epoch > after_epoch or self.waiting <= 1
+                    if turn and new and ADMIT_SHORT_FIRST > 0:
+                        turn = self._admit_next() is entry
                 if turn and self.ctl.acquire(timeout=0.5):
+                    if new and ADMIT_SHORT_FIRST > 0:
+                        with self.slot_cv:              # a shorter one came while this one waited in acquire()
+                            first = self._admit_next() is entry
+                        if not first:
+                            self.ctl.release()
+                            with self.slot_cv:
+                                self.slot_cv.notify_all()
+                            continue
                     if self.alive():
                         break
                     self.ctl.release()                  # it died (or is being restarted) while this one was getting
@@ -1309,6 +1507,18 @@ class StrataEngine:
             self.ctl_epoch += 1
             self.slot_cv.notify_all()
         return True
+
+    def _admit_next(self):
+        """STRATA_ADMIT_SHORT_FIRST=<tokens> (the caller holds slot_cv): the new request that takes the control lines
+        next - one whose prompt is at most that long (it reads little) before a longer one, in arrival order within
+        each; a longer one that has waited STRATA_ADMIT_MAX_WAIT_S counts as short (it is never held back for good).
+        Off (unset or 0): whoever gets the lock first, as before.  Only the order changes, never what is read."""
+        now = time.monotonic()
+        ordered = [e for e in self.wait_lens if len(e) > 2 and e[2]]
+        if not ordered:
+            return None
+        return min(ordered, key=lambda e: (0 if e[0] <= ADMIT_SHORT_FIRST or now - e[1] >= ADMIT_MAX_WAIT_S else 1,
+                                           e[1]))
 
     SOLO_AGAIN_MAX = 2      # how often a request left alone in a slot goes back to the solo path
     SOLO_AGAIN_MIN_LEFT = 32  # ... only with at least this many tokens still allowed (max_tokens)
@@ -1347,7 +1557,7 @@ class StrataEngine:
         prompt, left = list(ids), int(max_new)
         reused0 = None      # the first read's reused tokens: a continued leg's count includes this request's own output
         carry = {}          # #1869: the figures of the legs that ended in a hand-back to the solo path (the final DONE adds to them)
-        ok = yield from self._take_control(cancel, len(prompt))
+        ok = yield from self._take_control(cancel, len(prompt), new=True)
         if not ok:
             return
         holding, born = True, self.gen                  # (the engine it now has the control lines of)
@@ -1376,21 +1586,25 @@ class StrataEngine:
                     def others():
                         with self.slot_cv:
                             return self.waiting > 0
-                    for x in self._control(cancel, pending.append, stop_when=others):
+
+                    def give_way():   # at a PP line, and between two far apart (the engine takes it at its next boundary)
+                        nonlocal reserved
+                        if (reserved is None and not out and not embeddings and yields < self.YIELDS_MAX and
+                                self._shorter_waiting(len(prompt))):
+                            with self.slot_cv:          # the slot the part read will wait in
+                                reserved = self.pick_slot(prompt)
+                                if reserved is not None:
+                                    self.slot_busy[reserved] = True
+                                    self.slot_claims.add(reserved)
+                            if reserved is not None:
+                                self._send(f"BYIELD {reserved}")
+                    for x in self._control(cancel, pending.append, stop_when=others, on_quiet=give_way):
                         while pending:
                             t = pending.pop(0)
                             out.append(t)
                             yield t
                         if x is None:                       # a heartbeat (False: a token, flushed above)
-                            if (reserved is None and not out and not embeddings and yields < self.YIELDS_MAX and
-                                    self._shorter_waiting(len(prompt))):
-                                with self.slot_cv:          # the slot the part read will wait in
-                                    reserved = self.pick_slot(prompt)
-                                    if reserved is not None:
-                                        self.slot_busy[reserved] = True
-                                        self.slot_claims.add(reserved)
-                                if reserved is not None:
-                                    self._send(f"BYIELD {reserved}")
+                            give_way()
                             yield None
                     phase = "none"                          # its DONE is read
                     while pending:
@@ -1486,17 +1700,21 @@ class StrataEngine:
                     self._ctl_mode, self._ctl_result, self._yielded = "batch", None, None
                     self._ctl_erred = False
                     asked = False
+
+                    def ask():        # as give_way above, for the slot this admission reads into
+                        nonlocal asked
+                        if (not asked and not embeddings and yields < self.YIELDS_MAX and
+                                self._shorter_waiting(len(prompt))):
+                            self._send(f"BYIELD {slot}")
+                            asked = True
                     try:
-                        for x in self._control(cancel, pending.append):
+                        for x in self._control(cancel, pending.append, on_quiet=ask):
                             while pending:
                                 t = pending.pop(0)
                                 out.append(t)
                                 yield t
                             if x is None:
-                                if (not asked and not embeddings and yields < self.YIELDS_MAX and
-                                        self._shorter_waiting(len(prompt))):
-                                    self._send(f"BYIELD {slot}")
-                                    asked = True
+                                ask()
                                 yield None
                     except ValueError as e:
                         # #1994: the engine says this slot is not free (its view and ours differ for a moment, or a
@@ -1649,6 +1867,7 @@ class StrataEngine:
 
     slot_groups = 1         # --batch-groups (set when the engine starts)
     SLOT_PREFIX_MIN = 512   # a held prefix shorter than this is not worth unbalancing the pipeline's groups
+    TURN_ID = 248045        # <|im_start|>: the engine's default --turn-token (its turn checkpoint sits at the last one)
 
     def pick_slot(self, prompt: list[int]) -> int | None:
         """A free slot for `prompt` (the caller holds slot_cv): the one whose held tokens are the longest start of the
@@ -1658,18 +1877,30 @@ class StrataEngine:
         if not free:
             return None
         gs = getattr(self, "slot_gs", 0)
-        if gs:
-            # pipelined groups: the engine keeps no pipelined slot as a conversation cache, so nothing is worth keeping
-            # free for a next turn.  A group's window spans its slots up to its last busy one, so first fill a hole
-            # below a busy slot of the same group (it costs no extra row), then follow the spreading order
+        if gs > 1:
+            # pipelined groups of several slots: the engine keeps no idle slot below a busy one as a conversation cache
+            # (its pad row writes the slot), so nothing is worth keeping free for a next turn.  A group's window spans
+            # its slots up to its last busy one, so first fill a hole below a busy slot of the same group (it costs no
+            # extra row), then follow the spreading order
             # (reported on #793: least-recently-used picks left leading holes, [_ B], that cost a whole row each)
             def fills_hole(b):
                 g0 = b - b % gs
                 return any(self.slot_busy[x] for x in range(b + 1, g0 + gs))
             return min(free, key=lambda b: (not fills_hole(b), self.slot_order.index(b)))
         def held_prefix(b):
+            # what of `prompt` the slot's cache serves: the slot's whole held stream (the prompt and what it decoded)
+            # when this prompt continues it, else its turn checkpoint - the engine takes one at the last <|im_start|> of
+            # a prompt (the next request of the chat renders the history again, but not the reply it decoded or the
+            # assistant header), so a prompt that agrees with the held tokens up to there is that chat's next turn
+            # too (#2518: it was only found by the engine's own source search, after pick_slot had sent it to another
+            # slot and the request in that slot had overwritten the chat whose cache the next one needed)
             h = self.slot_held[b]
-            return len(h) if h and len(h) < len(prompt) and prompt[:len(h)] == h else 0
+            if not h:
+                return 0
+            if len(h) < len(prompt) and prompt[:len(h)] == h:
+                return len(h)
+            k = len(h) - 1 - h[::-1].index(self.TURN_ID) if self.TURN_ID in h else 0
+            return k if 0 < k < len(prompt) and prompt[:k] == h[:k] else 0
         best = max(free, key=held_prefix)
         # without --batch-groups a held prefix of any length is taken, as before
         if held_prefix(best) >= (self.SLOT_PREFIX_MIN if self.slot_groups > 1 else 1):
@@ -2076,6 +2307,11 @@ class Vision:
         idle = cfg.get("idle_unload_s", 0)
         if isinstance(idle, bool) or not isinstance(idle, (int, float)) or not math.isfinite(idle) or idle < 0:
             raise ValueError("vision.idle_unload_s must be a finite non-negative number (0 disables it)")
+        configured_idle = cfg.get("elastic_idle_s")
+        if idle and configured_idle not in (None, 0) and float(configured_idle) != float(idle):
+            raise ValueError("vision.idle_unload_s and vision.elastic_idle_s disagree; use one idle interval")
+        # `idle_unload_s` was the fork's name for the same lazy lifecycle.  Keep it
+        # as a compatibility spelling while `elastic` remains the implementation.
         self.idle_unload_s = float(idle)
         self.resource_gpu_index = None
         device = cfg.get("cuda_device")
@@ -2095,12 +2331,22 @@ class Vision:
         self.video_policy = video_api.policy(cfg.get("video"))
         self.dir = self.work_dir()
         self.video_capable = False
+        self.video_probed = False
         self.spawn = (args, log, env)                   # to start it again after an unload
+        self._identity_paths = [absolute(cfg["exe"]), absolute(cfg["mmproj"]), absolute(cfg["model"])]
+        self.video_identity = self._video_identity(self._identity_paths, args)
         self.proc = None
         self.stopped = True
         self.lock = threading.Lock()
         self.cache: dict[str, tuple[Path, int]] = {}
-        if not lazy:
+        # opt-in (the vision section's "elastic": true): the encoder starts with
+        # the first visual request and stops after elastic_idle_s.  When the
+        # engine cache is elastic too, it keeps elastic_mib free for the encoder
+        # (Service._vision_up / _vision_idle_down).
+        self.elastic = cfg.get("elastic") is True or bool(idle)
+        self.elastic_mib = int(cfg.get("elastic_mib") or 2048)
+        self.elastic_idle_s = float(configured_idle or idle or 120)
+        if not lazy and not self.elastic:
             self._start()
 
     def _start(self, budget=None):
@@ -2112,6 +2358,7 @@ class Vision:
                           stderr=log or subprocess.DEVNULL, text=True, encoding="utf-8", bufsize=1, env=env,
                           cwd=self.dir)
         contain(self.proc)
+        self.video_capable, self.video_probed = False, False
         try:
             line = self._readline(VISION_READY_S, "the vision encoder did not start", budget)
             if not line.startswith("READY"):
@@ -2121,23 +2368,39 @@ class Vision:
             # another request may start an encoder or reuse the FIFO.
             proc = self.proc
             self.stopped = True
+            self._kill_proc(proc)
             try:
-                proc.kill()
-            except OSError:
-                pass                                # it may already have exited; still reap and close its pipes
-            try:
-                proc.wait(timeout=5)
+                self._wait_proc(proc, 5)
             except subprocess.TimeoutExpired:
                 raise EngineStuck("the vision encoder is still stopping after startup cancellation") from None
+            except (OSError, ValueError):
+                pass                                # it may already have exited; still close its pipes
             self.proc = None
-            proc.stdin.close()
-            proc.stdout.close()
+            self._close_proc_pipes(proc)
             raise
         self.stopped = False
 
         self.video_capable = "video=SVF2" in line.split()
-        # A new resident encoder is a new identity, even if weights were replaced in place.
-        self.video_identity = uuid.uuid4().hex
+        self.video_probed = True
+        self.video_identity = self._video_identity(self._identity_paths, self.spawn[0])
+
+    @staticmethod
+    def _video_identity(paths, args) -> str:
+        """A stable identity for an encoder build and its weights.
+
+        Elastic unload/restart must not invalidate every video cache entry.  File size and nanosecond mtime identify
+        the mounted executable, mmproj and model; the spawn arguments and cache format cover configuration changes.
+        """
+        files = []
+        for path in paths:
+            real = os.path.abspath(path)
+            try:
+                st = os.stat(real)
+                files.append({"path": real, "size": st.st_size, "mtime_ns": st.st_mtime_ns})
+            except OSError:
+                files.append({"path": real, "missing": True})
+        material = {"format": "SVF2-SVE1-layout-v1", "args": args, "files": files}
+        return hashlib.sha256(json.dumps(material, sort_keys=True).encode()).hexdigest()
 
     def encode_video(self, packet, output, budget):
         """Encode one packet; the caller owns the output (and any cache publication)."""
@@ -2206,8 +2469,8 @@ class Vision:
             except BaseException:
                 if not clean_rejection:
                     self.stopped = True
-                    proc.kill()
-                    proc.wait(timeout=5)
+                    self._kill_proc(proc)
+                    self._wait_proc(proc, 5)
                 Path(output).unlink(missing_ok=True)
                 raise
             finally:
@@ -2251,12 +2514,43 @@ class Vision:
                 raise video_api.VideoError(f"{what}: startup timed out after {timeout:.0f} s") from None
             raise RuntimeError(f"{what}: it said nothing for {timeout:.0f} s") from None
 
+    @staticmethod
+    def _proc_poll(proc):
+        """A process stand-in without poll() is treated as live until its owner closes or reaps it."""
+        poll = getattr(proc, "poll", None)
+        return None if poll is None else poll()
+
+    @staticmethod
+    def _wait_proc(proc, timeout: float):
+        wait = getattr(proc, "wait", None)
+        return 0 if wait is None else wait(timeout=timeout)
+
+    @staticmethod
+    def _kill_proc(proc) -> None:
+        kill = getattr(proc, "kill", None)
+        if kill is not None:
+            try:
+                kill()
+            except OSError:
+                pass
+
+    @staticmethod
+    def _close_proc_pipes(proc) -> None:
+        for name in ("stdin", "stdout"):
+            pipe = getattr(proc, name, None)
+            if pipe is not None:
+                try:
+                    pipe.close()
+                except (OSError, ValueError, AttributeError):
+                    pass
+
     def alive(self) -> bool:
         proc = self.proc
-        return proc is not None and not self.stopped and proc.poll() is None
+        return proc is not None and not self.stopped and self._proc_poll(proc) is None
 
     def video_available(self) -> bool:
-        return bool(self.video_policy and self.video_capable and (self.alive() or self.idle_unload_s)
+        return bool(self.video_policy and self.video_capable
+                    and (self.alive() or getattr(self, "elastic", False))
                     and all(shutil.which(self.video_policy[k]) for k in ("ffmpeg", "ffprobe")))
 
     def unload(self):
@@ -2268,18 +2562,17 @@ class Vision:
         """Start the encoder again after an unload (or if it died); the cache of encoded images is kept."""
         if self.proc is not None:
             self.stopped = True
+            self._kill_proc(self.proc)
             try:
-                self.proc.kill()
-            except OSError:
-                pass
-            try:
-                self.proc.wait(timeout=5)
+                self._wait_proc(self.proc, 5)
             except subprocess.TimeoutExpired:
                 raise EngineStuck("the previous vision encoder is still stopping") from None
-            self.proc.stdin.close()
-            self.proc.stdout.close()
+            except (OSError, ValueError):
+                pass
+            self._close_proc_pipes(self.proc)
         self.proc = None
         self.stopped = True
+        self.video_capable, self.video_probed = False, False
         self._start(budget)
 
     @staticmethod
@@ -2415,30 +2708,29 @@ class Vision:
         self.stopped = True
         if proc is None:
             return
+        exited = False
         try:
             try:
-                if proc.poll() is None:
-                    proc.stdin.write("QUIT\n")
-                    proc.stdin.flush()
-                    proc.wait(timeout=10)
-            except (OSError, ValueError, subprocess.TimeoutExpired):
-                try:
-                    proc.kill()
-                except OSError:
-                    pass
-                proc.wait(timeout=10)
+                if self._proc_poll(proc) is None:
+                    stdin = getattr(proc, "stdin", None)
+                    if stdin is None:
+                        raise OSError("the vision encoder has no input pipe")
+                    stdin.write("QUIT\n")
+                    stdin.flush()
+                    self._wait_proc(proc, 10)
+                exited = True
+            except (OSError, ValueError, AttributeError, subprocess.TimeoutExpired):
+                self._kill_proc(proc)
+                self._wait_proc(proc, 10)
+                exited = True
         except subprocess.TimeoutExpired:
             # Keep ownership: a later unload/restart must reap this process,
             # never start a second encoder while its VRAM is still held.
             raise EngineStuck("the vision encoder is still releasing GPU/RAM; retry after it exits") from None
         finally:
-            if proc.poll() is not None:
+            if exited or self._proc_poll(proc) is not None:
                 self.proc = None
-                for pipe in (proc.stdin, proc.stdout):
-                    try:
-                        pipe.close()
-                    except (OSError, ValueError):
-                        pass
+                self._close_proc_pipes(proc)
 
     def shutdown(self):
         """#914: close() for good: the server ends, so the encoder's directory (one ~10 MB .sve per image, on a tmpfs
@@ -2845,22 +3137,31 @@ class ByteTokenizer:
     ALWAYS = ()                                     # specials matched without parse_special (type 4, as <think>)
 
     @property
+    def max_special_len(self):
+        return max(len(s) for s in self.SPECIALS)
+
+    @property
     def control_tokens(self):
         return [s for s in self.SPECIALS if s not in self.ALWAYS]
 
     def encode(self, text, parse_special=False, plain=()):
-        out, i = [], 0
+        return self.encode_marked(text, parse_special, plain)[0]
+
+    def encode_marked(self, text, parse_special=False, plain=()):
+        """encode() and its resume points (after each special), as strata_tokenizer's for PromptEncoder."""
+        out, marks, i = [], [], 0
         while i < len(text):
             for k, s in enumerate(self.SPECIALS):
                 if (parse_special or s in self.ALWAYS) and text.startswith(s, i) and not any(
                         a <= i < b for a, b in plain):
                     out.append(256 + k)
                     i += len(s)
+                    marks.append((i, len(out)))
                     break
             else:
                 out.extend(text[i].encode("utf-8"))
                 i += 1
-        return out
+        return out, marks
 
     def decode(self, ids, errors="replace"):
         raw = bytearray()
@@ -3007,10 +3308,12 @@ class Service:
         self.literals = literal_tags(getattr(tokenizer, "control_tokens", ()))   # texts that stay text inside a message
         self.fit_max_tokens = fit_max_tokens          # --fit-max-tokens: clamp the output cap instead of 400
         self.aliases: list[str] = []                  # #297: other names of the model (the config's `aliases`)
+        self.answer_room = True                       # 0.1.45: see ANSWER_ROOM_MIN_CAP (the config's "answer_room": false turns it off)
         self.reasoning_close_retry = False            # #1053 (opt-in): close the thinking once when a reply ends inside it
         self.codex_compaction_cache = False           # #924 (opt-in): a Codex compaction is rendered with its conversation's tools
         self.codex_thread_titles = False              # #923 (opt-in): answer Codex's thread-title turns without the engine
         self.sampling_defaults = dict(sampling_defaults or {})   # the run config's `sampling` block
+        self.model_arch = None                        # the config's family ("qwen4exp", "qwen35moe"): None = no model-card defaults
         self.shared = {}                              # the web app's Chat settings for every client (POST /settings)
         self.shared_path = None                       # where they are kept between starts (next to the config)
         self.config_effort = None                     # #1641: the config's "reasoning_effort": the level for requests with none
@@ -3054,23 +3357,24 @@ class Service:
                        "prompt_ms": 0.0, "decode_ms": 0.0,
                        "drafts_offered": 0, "drafts_accepted": 0}   # #457: the MTP drafts, summed where reported
         self.last_timings = None                         # the last finished request's, llama.cpp's names (/v1/status)
+        # /metrics/prometheus' two throughput gauges need the totals as they stood at the last scrape, because
+        # llama.cpp averages them over the window between two scrapes (#2341).
+        self.scrape_bucket = (0, 0.0, 0, 0.0)
         from serve.prometheus import Latencies
         self.latencies = Latencies()                     # GET /metrics in Prometheus text: the latency histograms
         self.last_request_at = None                      # when a request last started or finished
         self.started_at = time.time()
         self.status_lock = threading.Lock()
+        self._control_cv = threading.Condition(self.status_lock)
+        self._control_active = False
         # Video preparation and generation share one lifecycle lease, even while
         # the public queue counter hands off to _run. Guard both fields with status_lock.
         self._video_requests = 0
         self._unloading = False
-        self.vision_idle_unload_s = getattr(vision, "idle_unload_s", 0)
-        spawn_args = getattr(engine, "spawn", (None, []))[1]
-        if self.vision_idle_unload_s and (getattr(engine, "batch", 0)
-                or any(flag in spawn_args for flag in ("--batch", "--slots"))):
-            raise ValueError("vision.idle_unload_s does not support engine batching")
+        # Image preparation may not have marked the engine busy yet, so it holds
+        # its own lease while the elastic lifecycle decides whether to unload.
         self._vision_requests = 0
         self._image_prepare_lock = threading.Lock()
-        self._vision_last_used = time.monotonic()
         self._idle_stop = threading.Event()
         self._idle_thread = None
         self._vision_last_unload = None
@@ -3086,13 +3390,29 @@ class Service:
         self.vram_free_wait_s = 15.0                     # how long a full card is waited on (memory given back)
         self.before_load_strict = False                  # #1997: refuse (503) whenever it fails
         self.vram_reserve = None                         # #533: the last POST /v1/vram reserve (None: the start's)
+        self.vram_reserve_asked = False                  # a POST /v1/vram was made (vram_reserve None is then asked)
+        self.vision_held = False                         # an elastic encoder holds VRAM the expert cache gave it
+        self.last_image_at = 0.0                         # when visual work last ended (the elastic encoder's idle)
         self.reasoning_loop_recovery = False
         self.reasoning_budget_tokens = 0                 # #123: the config's default thinking budget (0: none)
         self.repeat_stop_tokens = REPEAT_STOP_TOKENS     # #606: one token this many times in a row ends a reply (0: off)
         self.anthropic_think_unasked = True               # #278: "anthropic_thinking": "on_request" -> False
         self.tool_call_recovery = False                   # opt-in: tool calls in forms next to the template's
+        self.images = None                                # serve/images.py's ImageGen when the config has "images"
+        self.restore_after_load = None                    # a session file an image job saved before it unloaded
         self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
                             tokenizer.encode("<|endoftext|>", parse_special=True))
+        # #567: a prompt re-encodes only what follows the last special token it shares with a recent prompt (the
+        # same ids as a full encode: tools/strata_tokenizer.py PromptEncoder).  Tokenizers without resume points
+        # encode in full.
+        self.prompts = None
+        if hasattr(tokenizer, "encode_marked") and hasattr(tokenizer, "max_special_len"):
+            from strata_tokenizer import PromptEncoder
+            # one kept prompt per conversation the engine's cache can hold (--conversation-cache-slots); the
+            # encoder's own default without that setting
+            slots = conversation_slots(engine)
+            self.prompts = PromptEncoder(tokenizer, keep=slots) if slots is not None and slots > 0 \
+                else PromptEncoder(tokenizer)
 
     def loaded(self) -> bool:
         return not hasattr(self.engine, "alive") or self.engine.alive()
@@ -3208,41 +3528,164 @@ class Service:
             raise ValueError(f"reasoning_budget_tokens={value!r}: expected a whole number of tokens (0: no budget)")
         return value if value > 0 else None
 
+    def _mark_vision_activity(self):
+        """Refresh the one idle clock used by the upstream elastic lifecycle."""
+        self.last_image_at = time.time()
+
     def _vision_down(self) -> bool:
-        return self.vision is not None and hasattr(self.vision, "alive") and not self.vision.alive()
+        """The encoder should run and does not (the engine's load starts it again).  An elastic encoder is down
+        between pictures by design: it starts in the image turn (_vision_up), not with the engine."""
+        return (self.vision is not None and hasattr(self.vision, "alive") and not self.vision.alive()
+                and not getattr(self.vision, "elastic", False))
+
+    def _engine_reserve(self) -> int | None:
+        """The VRAM the engine keeps free for other programs outside an elastic encoder's turn: the last POST /v1/vram
+        reserve, or 0 when none was asked (the cache grows back to its full size; None would leave the reserve the engine
+        started with, a segment or more below the size it had)."""
+        return self.vram_reserve if self.vram_reserve_asked else 0
+
+    def _vision_up(self, budget=None):
+        """The image turn's start for an elastic encoder that is not running (the caller holds self.fifo): the expert
+        cache first keeps the encoder's elastic_mib of VRAM free on top of the reserve, then the encoder starts (load and
+        warm-up, a few seconds).  If the cache cannot shrink (an engine without --vram-elastic, the resident low-RAM mode)
+        the encoder starts anyway, as a non-elastic one would."""
+        v = self.vision
+        if not getattr(v, "elastic", False) or v.alive():
+            return
+        if hasattr(self.engine, "vram") and self.loaded():
+            try:
+                out = self.engine.vram((self._engine_reserve() or 0) + v.elastic_mib)
+                self.vision_held = True
+                print(f"[strata] vision: the expert cache keeps {v.elastic_mib} MiB free for the vision encoder "
+                      f"({out.get('expert_cache_mib')} of {out.get('expert_cache_full_mib')} MiB left)", flush=True)
+            except ValueError as e:
+                print(f"[strata] vision: the expert cache did not make room for the vision encoder ({e}); starting "
+                      "it anyway", flush=True)
+        if self.vision_held:
+            time.sleep(0.2)          # the driver's free-VRAM counter shows the cache's release a moment later
+        free0, t0 = self.free_vram_mib(), time.time()
+        try:
+            if budget is None:
+                v.restart()
+            else:
+                v.restart(budget=budget)
+        except BaseException:
+            if self.vision_held and hasattr(self.engine, "vram") and self.loaded():
+                try:
+                    self.engine.vram(self._engine_reserve())
+                except Exception as e:              # noqa: BLE001 - keep the start error as the request's cause
+                    print(f"[strata] vision: the expert cache did not grow back after the encoder failed to start "
+                          f"({e})", flush=True)
+            self.vision_held = False
+            raise
+        free1 = self.free_vram_mib()
+        took = f", {free0 - free1} MiB of VRAM" if free0 is not None and free1 is not None else ""
+        print(f"[strata] vision: the encoder started in {time.time() - t0:.1f} s{took}", flush=True)
+        self._mark_vision_activity()
+
+    def _vision_idle_down(self, force: bool = False) -> str:
+        """An elastic encoder idle for elastic_idle_s (or force) stops, and the expert cache takes its VRAM back:
+        "down", "busy" (a request holds the turn, or a picture came more recently) or "nothing" (not elastic or not
+        holding anything)."""
+        v = self.vision
+        if not getattr(v, "elastic", False) or not (self.vision_held or v.alive()):
+            return "nothing"
+        if not force and time.time() - self.last_image_at < v.elastic_idle_s:
+            return "busy"
+        if not self.fifo.acquire(blocking=False):
+            return "busy"
+        try:
+            try:
+                with self._engine_control(wait=False):
+                    with self.status_lock:
+                        if self._vision_requests or self._video_requests or self.status.get("busy"):
+                            return "busy"
+                    held = self.vision_held
+                    before = self._vision_resource_snapshot(getattr(v, "proc", None))
+                    started = time.monotonic()
+                    v.unload()
+                    elapsed = time.monotonic() - started
+                    after = self._vision_resource_snapshot()
+                    reclaimed, reclaim_error = False, None
+                    if held and hasattr(self.engine, "vram") and self.loaded():
+                        try:
+                            out = self.engine.vram(self._engine_reserve())
+                            reclaimed = True
+                            print(f"[strata] vision: the encoder stopped after {v.elastic_idle_s:g} s without "
+                                  f"visual work; the expert cache took its VRAM back "
+                                  f"({out.get('expert_cache_mib')} of {out.get('expert_cache_full_mib')} MiB)",
+                                  flush=True)
+                        except Exception as e:  # noqa: BLE001 - the encoder has stopped; release its logical share
+                            reclaim_error = str(e)
+                            print(f"[strata] vision: the encoder stopped after {v.elastic_idle_s:g} s without "
+                                  f"visual work, but the expert cache did not take the share back ({e})",
+                                  flush=True)
+                    else:
+                        print(f"[strata] vision: the encoder stopped after {v.elastic_idle_s:g} s without visual "
+                              "work", flush=True)
+                    # The process is gone even if the cache could not grow.  Keeping this true would make a later
+                    # POST /v1/vram reserve room for an encoder that no longer exists.
+                    self.vision_held = False
+                    with self.status_lock:
+                        self._vision_last_unload = {
+                            "at": time.time(), "elapsed_s": round(elapsed, 3), "process_exited": True,
+                            "scope": "whole_devices_and_system", "before": before, "after": after,
+                            "vram_reclaimed": reclaimed, "vram_error": reclaim_error}
+            except ModelBusy:
+                return "busy"
+            def value(n):
+                return "unavailable" if n is None else f"{n:.1f}"
+            def change(a, b):
+                delta = None if a is None or b is None else a - b
+                return f"{value(a)}->{value(b)} decrease={value(delta)} MiB"
+            gpu_after = {g["index"]: g["used_mib"] for g in after["gpus"]}
+            gpu_changes = " ".join(f"gpu[{g['index']}]={change(g['used_mib'], gpu_after.get(g['index']))}"
+                                   for g in before["gpus"]) or "gpu=unavailable"
+            print(f"[strata] vision stage=idle_unload elapsed_s={elapsed:.3f} "
+                  f"process_exited=True process_rss_before_mib={value(before['process_rss_mib'])} "
+                  f"process_private_before_mib={value(before['process_private_mib'])} "
+                  f"{gpu_changes} system_ram={change(before['system_ram_used_mib'], after['system_ram_used_mib'])} "
+                  "scope=whole_devices_and_system", flush=True)
+            return "down"
+        finally:
+            self.fifo.release()
+
+    def start_vision_idle(self):
+        v = self.vision
+        if not getattr(v, "elastic", False):
+            return
+        print(f"[strata] vision: the encoder starts with the first image or video and stops after {v.elastic_idle_s:g} s "
+              f"without visual work; where the expert cache can resize, it keeps {v.elastic_mib} MiB free for it",
+              flush=True)
+
+        def loop():
+            while True:
+                time.sleep(max(1.0, min(30.0, v.elastic_idle_s / 4)))
+                try:
+                    self._vision_idle_down()
+                except Exception as e:                 # tried again at the next turn; the thread keeps running
+                    print(f"[strata] images: stopping the idle image encoder: {e}", flush=True)
+        threading.Thread(target=loop, daemon=True).start()
 
     def free_vram_mib(self) -> int | None:
-        """Free VRAM on the engine's (first) GPU, from NVML (AMD backend: amdgpu's sysfs files, #301); None when it can't
-        be read (then nothing is refused)."""
+        """Free VRAM on the engine's (first) GPU, from the backend's reader - NVML, the amdgpu sysfs files (#301) or
+        IOKit on macOS (Metal backend); None when it can't be read (then nothing is refused)."""
         try:
-            if getattr(self, "backend", None) == "hip":
-                from serve.telemetry import free_vram_mib
-                return free_vram_mib(int(getattr(self, "gpu_index", 0) or 0), amd=True)
-            from serve.telemetry import _Nvml
-            nv = _Nvml(int(getattr(self, "gpu_index", 0) or 0))
-            if not nv.ok():
+            from serve.telemetry import gpu_reader
+            g = gpu_reader(int(getattr(self, "gpu_index", 0) or 0), amd=getattr(self, "backend", None) == "hip")
+            if not g.ok():
                 return None
-            m = nv.Mem()
-            if nv.lib.nvmlDeviceGetMemoryInfo(nv.dev, ctypes.byref(m)) != 0:
+            r = g.read()
+            if r.get("mem_total") is None or r.get("mem_used") is None:
                 return None
-            return int(m.free >> 20)
+            return int((r["mem_total"] - r["mem_used"]) >> 20)
         except Exception:
             return None
 
-    def ensure_loaded(self, *, vision=None):
+    def ensure_loaded(self):
         """Start the engine if it is not running (unloaded, or it died - issue #27), after the before_load hook and
         the free-VRAM check.  The caller holds self.fifo."""
-        # A full cold start keeps the original vision-first VRAM sizing order.
-        # Only a resident text engine may leave its idle encoder asleep.
-        want_vision = (not self.vision_idle_unload_s or not self.loaded()) if vision is None else vision
-        if self.loaded() and (not want_vision or not self._vision_down()):
-            if vision is True:
-                self._vision_last_used = time.monotonic()
-            return
-        if self.vision_idle_unload_s and self.loaded() and want_vision:
-            # The resident engine already owns its VRAM. The full-model hook
-            # and free-VRAM threshold would incorrectly gate an encoder-only wake.
-            self.ensure_vision_loaded()
+        if self.loaded() and not self._vision_down():
             return
         hook_failed = None
         if self.before_load:
@@ -3294,14 +3737,14 @@ class Service:
                 print(f"[strata] the before_load command failed ({hook_failed}), but {free} MiB of VRAM is free: "
                       "loading", flush=True)
         vision_started = False
-        if want_vision and self._vision_down():          # first, as at a start: a GPU encoder takes its VRAM before
+        if self._vision_down():                          # first, as at a start: a GPU encoder takes its VRAM before
             print("[strata] starting the vision encoder ...", flush=True)   # the engine sizes its cache
             try:
                 self.vision.restart()
             except Exception as e:
                 raise EngineDied(f"the vision encoder failed to start: {e}") from e
             vision_started = True
-            self._vision_last_used = time.monotonic()
+            self._mark_vision_activity()
         if self.loaded():
             return
         if getattr(self.engine, "unloaded", False):
@@ -3317,6 +3760,8 @@ class Service:
                 self.vision.unload()
             raise
         print("[strata] the engine is running again", flush=True)
+        if self.restore_after_load:                      # an image job unloaded it: its conversation comes back
+            images_api.restore_session(self)
         if self.vram_reserve is not None and hasattr(self.engine, "vram"):   # #533: the reserve asked for last
             try:
                 self.engine.vram(self.vram_reserve)
@@ -3334,25 +3779,20 @@ class Service:
             raise ValueError("this engine cannot resize its VRAM use")
         if not self.fifo.acquire(timeout=self.vram_wait_s):
             raise ModelBusy("a request is still running; try again when it has finished")
-        # parallel requests do not hold the fifo: the engine's control lines (a prompt being admitted) are taken too,
-        # and the engine refuses a resize while a slot decodes
-        ctl = getattr(self.engine, "ctl", None) if getattr(self.engine, "batch", 0) else None
-        if ctl is not None and not ctl.acquire(timeout=self.vram_wait_s):
-            self.fifo.release()
-            raise ModelBusy("a request is still running; try again when it has finished")
         try:
-            if not self.loaded():
-                self.vram_reserve = reserve_mib
-                return {"status": "not loaded", "reserve_mib": reserve_mib,
-                        "note": "applied when the model loads"}
-            out = self.engine.vram(reserve_mib)
-            self.vram_reserve = reserve_mib
-            print(f"[strata] VRAM: {out.get('vram_free_mib')} MiB free, expert cache {out.get('expert_cache_mib')} of "
-                  f"{out.get('expert_cache_full_mib')} MiB ({out.get('expert_slots')} experts)", flush=True)
-            return {"status": "ok", **out}
+            with self._engine_control(timeout=self.vram_wait_s):
+                if not self.loaded():
+                    self.vram_reserve, self.vram_reserve_asked = reserve_mib, True
+                    return {"status": "not loaded", "reserve_mib": reserve_mib,
+                            "note": "applied when the model loads"}
+                # an elastic encoder that runs keeps its VRAM on top of the asked reserve
+                out = self.engine.vram((reserve_mib or 0) + self.vision.elastic_mib if self.vision_held else reserve_mib)
+                self.vram_reserve, self.vram_reserve_asked = reserve_mib, True
+                print(f"[strata] VRAM: {out.get('vram_free_mib')} MiB free, expert cache "
+                      f"{out.get('expert_cache_mib')} of {out.get('expert_cache_full_mib')} MiB "
+                      f"({out.get('expert_slots')} experts)", flush=True)
+                return {"status": "ok", **out}
         finally:
-            if ctl is not None:
-                ctl.release()
             self.fifo.release()
 
     def _say_died(self, e: Exception) -> None:
@@ -3362,15 +3802,11 @@ class Service:
         print(f"[strata] {e}. {note} The next request starts the engine again."
               f"{' Its log: ' + log if log else ''}", flush=True)
 
-    def load(self, *, vision=None):
+    def load(self, cancel=None):
         """POST /load and every generation request: start the engine now if it is unloaded (raises GpuBusy)."""
         # a request is on its way: the idle thread must not unload between this and the request's own start
         self.last_request_at = time.time()
-        want_vision = (not self.vision_idle_unload_s or not self.loaded()) if vision is None else vision
-        if (self.loaded() and (not want_vision or not self._vision_down())
-                and not (self.vision_idle_unload_s and vision is True)):
-            if vision is True:
-                self._vision_last_used = time.monotonic()
+        if self.loaded() and not self._vision_down():
             return
         trace = getattr(self.request_trace, "record", None)
         waiting = time.perf_counter()
@@ -3388,7 +3824,8 @@ class Service:
                         trace["queue_s"] += round(loading - waiting, 3)
                         trace["state"] = "loading"
                 try:
-                    self.ensure_loaded(vision=vision)
+                    with self._engine_control(cancel):
+                        self.ensure_loaded()
                 finally:
                     if trace is not None:
                         with self.status_lock:
@@ -3429,8 +3866,10 @@ class Service:
                 self._unloading = True
             if not self.engine.alive() and (self.vision is None or
                     (not self.vision.alive() and getattr(self.vision, "proc", None) is None)):
+                self.vision_held = False
                 return "not loaded"
             self.engine.unload()
+            self.vision_held = False
             if self.vision is not None and hasattr(self.vision, "unload"):
                 self.vision.unload()
             print(f"[strata] model unloaded{f' after {idle_for:.0f} s idle' if idle_for else ''}; "
@@ -3442,23 +3881,26 @@ class Service:
             self.fifo.release()
 
     def ensure_vision_loaded(self, budget=None):
-        """Caller holds fifo and a visual activity lease; never restarts the text engine."""
-        if not self._vision_down():
-            return
-        started = time.monotonic()
-        try:
-            self.vision.restart(budget=budget)
-        except video_api.VideoError:
-            raise
-        except Exception as e:
-            raise EngineDied(f"the vision encoder failed to start: {e}") from e
-        finally:
-            self._vision_last_used = time.monotonic()
-            print(f"[strata] vision stage=load elapsed_s={time.monotonic() - started:.3f} "
-                  f"ready={self.vision.alive()}", flush=True)
+        """Use the upstream elastic path when enabled, otherwise keep a resident encoder alive."""
+        if self.vision is None:
+            raise EngineDied("this server has no vision encoder")
+        if getattr(self.vision, "elastic", False):
+            self._vision_up(budget)
+        elif self._vision_down():
+            started = time.monotonic()
+            try:
+                self.vision.restart(budget=budget)
+            except video_api.VideoError:
+                raise
+            except Exception as e:
+                raise EngineDied(f"the vision encoder failed to start: {e}") from e
+            finally:
+                print(f"[strata] vision stage=load elapsed_s={time.monotonic() - started:.3f} "
+                      f"ready={self.vision.alive()}", flush=True)
+        self._mark_vision_activity()
 
     @contextlib.contextmanager
-    def image_activity(self):
+    def image_activity(self, cancel=None):
         # Register before waiting on fifo; unload uses the same status lock.
         with self.status_lock:
             self._vision_requests += 1
@@ -3467,52 +3909,13 @@ class Service:
             # cached files have been copied to a request-owned embedding file.
             with self._image_prepare_lock:
                 with self.fifo:
-                    self.ensure_loaded(vision=True)
+                    with self._engine_control(cancel):
+                        self.ensure_loaded()
                 yield
         finally:
             with self.status_lock:
                 self._vision_requests -= 1
-                self._vision_last_used = time.monotonic()
-
-    def unload_idle_vision(self):
-        """Keep the text engine and on-disk embeddings; close only an idle encoder."""
-        if not self.vision_idle_unload_s or not self.fifo.acquire(blocking=False):
-            return "busy"
-        try:
-            with self.status_lock:
-                if (self._vision_requests or self._video_requests or self.status.get("busy")
-                        or time.monotonic() - self._vision_last_used < self.vision_idle_unload_s):
-                    return "busy"
-                # Close outside status_lock. New visual requests register, then
-                # wait on fifo and reload; no request uses the process directly.
-            if not self.vision.alive() and getattr(self.vision, "proc", None) is None:
-                return "not loaded"
-            before = self._vision_resource_snapshot(getattr(self.vision, "proc", None))
-            started = time.monotonic()
-            self.vision.unload()
-            elapsed = time.monotonic() - started
-            after = self._vision_resource_snapshot()
-            report = {"at": time.time(), "elapsed_s": round(elapsed, 3), "process_exited": True,
-                      "scope": "whole_devices_and_system",
-                      "before": before, "after": after}
-            with self.status_lock:
-                self._vision_last_unload = report
-            def value(n):
-                return "unavailable" if n is None else f"{n:.1f}"
-            def change(a, b):
-                delta = None if a is None or b is None else a - b
-                return f"{value(a)}->{value(b)} decrease={value(delta)} MiB"
-            gpu_after = {g["index"]: g["used_mib"] for g in after["gpus"]}
-            gpu_changes = " ".join(f"gpu[{g['index']}]={change(g['used_mib'], gpu_after.get(g['index']))}"
-                                   for g in before["gpus"]) or "gpu=unavailable"
-            print(f"[strata] vision stage=idle_unload elapsed_s={elapsed:.3f} "
-                  f"process_exited=True process_rss_before_mib={value(before['process_rss_mib'])} "
-                  f"process_private_before_mib={value(before['process_private_mib'])} "
-                  f"{gpu_changes} system_ram={change(before['system_ram_used_mib'], after['system_ram_used_mib'])} "
-                  "scope=whole_devices_and_system", flush=True)
-            return "unloaded"
-        finally:
-            self.fifo.release()
+                self._mark_vision_activity()
 
     def _vision_resource_snapshot(self, process=None):
         try:
@@ -3525,24 +3928,14 @@ class Service:
                 "process_rss_mib": None, "process_private_mib": None}
 
     def start_idle_unload(self):
-        whole = self.idle_unload_s if hasattr(self.engine, "unload") else 0
-        intervals = [s for s in (whole, self.vision_idle_unload_s) if s > 0]
-        if not intervals:
+        if not self.idle_unload_s or not hasattr(self.engine, "unload"):
             return
-        if whole:
-            print(f"[strata] the model unloads after {whole} s without requests", flush=True)
-        if self.vision_idle_unload_s:
-            print(f"[strata] vision unloads independently after {self.vision_idle_unload_s} s without visual work",
-                  flush=True)
+        print(f"[strata] the model unloads after {self.idle_unload_s} s without requests", flush=True)
 
         def loop():
-            floor = 0.1 if self.vision_idle_unload_s else 1.0
-            while not self._idle_stop.wait(max(floor, min(30.0, min(intervals) / 4))):
+            while not self._idle_stop.wait(max(1.0, min(30.0, self.idle_unload_s / 4))):
                 try:
-                    if whole:
-                        self.unload(idle_for=whole)
-                    if self.vision_idle_unload_s:
-                        self.unload_idle_vision()
+                    self.unload(idle_for=self.idle_unload_s)
                 except EngineStuck as e:                # tried again at the next turn; the thread keeps running
                     print(f"[strata] idle unload: {e}", flush=True)
         self._idle_thread = threading.Thread(target=loop, daemon=True, name="strata-idle-unload")
@@ -3566,10 +3959,15 @@ class Service:
                 print(f"[strata] could not save the shared settings: {e}", flush=True)
         return self.shared
 
+    def effort_default(self) -> str | None:
+        """The thinking level of a request that names none: the Chat settings shared with apps first, then the config's
+        "reasoning_effort" (#1641).  Every API reads it here (the Responses API did not: 0.1.44.1)."""
+        return self.shared.get("reasoning_effort") or self.config_effort
+
     def with_shared(self, req: dict, api: str) -> dict:
         """The request with the shared thinking level and max tokens filled in where it has none of its own."""
         s = self.shared
-        effort = s.get("reasoning_effort") or self.config_effort   # the Chat settings first, then the config's
+        effort = self.effort_default()
         if not s and not effort:
             return req
         req = dict(req)
@@ -3578,7 +3976,7 @@ class Service:
         if effort:
             if api == "openai":
                 ctk = req.get("chat_template_kwargs") if isinstance(req.get("chat_template_kwargs"), dict) else {}
-                if not req.get("reasoning_effort") and not req.get("reasoning") and \
+                if req.get("reasoning_effort") in (None, "") and not req.get("reasoning") and \
                         "enable_thinking" not in ctk and "reasoning_effort" not in ctk:
                     req["reasoning_effort"] = effort
             elif not req.get("thinking") and not req.get("output_config"):
@@ -3597,7 +3995,7 @@ class Service:
                                        gpu_index=int(getattr(self, "gpu_index", 0) or 0),
                                        gpu_indices=getattr(self, "gpu_indices", None),
                                        resource_gpu_index=(getattr(self.vision, "resource_gpu_index", None)
-                                                           if self.vision_idle_unload_s else None),
+                                                           if getattr(self.vision, "elastic", False) else None),
                                        amd=getattr(self, "backend", None) == "hip")
             if getattr(self, "engine", None) is not None and hasattr(self.engine, "gpu_busy"):
                 # #1317: the quick frozen-engine check does not end an engine whose GPU is busy (a long prompt chunk on a
@@ -3731,8 +4129,15 @@ class Service:
         with self.status_lock:
             s, t = dict(self.status), dict(self.totals)
             running = len(self.live_reqs) or int(bool(s.get("busy")))
-        prompt_n = t["prompt_tokens"] - t["reused"]               # what was read, as llama.cpp counts it
-        prompt_s, decode_s = t["prompt_ms"] / 1000, t["decode_ms"] / 1000
+            prompt_n = t["prompt_tokens"] - t["reused"]               # what was read, as llama.cpp counts it
+            prompt_s, decode_s = t["prompt_ms"] / 1000, t["decode_ms"] / 1000
+            # llama.cpp reads these two gauges from a bucket it resets on every scrape (server_metrics::bucket,
+            # "the gauges are averaged over the window between two scrapes"), so an idle server reports 0 rather
+            # than its lifetime average. Keep the same window here, or the names lie to llama.cpp dashboards.
+            was_prompt_n, was_prompt_s, was_predicted_n, was_decode_s = self.scrape_bucket
+            self.scrape_bucket = (prompt_n, prompt_s, t["output_tokens"], decode_s)
+        d_prompt_n, d_prompt_s = prompt_n - was_prompt_n, prompt_s - was_prompt_s
+        d_predicted_n, d_decode_s = t["output_tokens"] - was_predicted_n, decode_s - was_decode_s
         rows = [
             ("llamacpp:prompt_tokens_total", "counter", "Prompt tokens read", prompt_n),
             ("llamacpp:prompt_tokens_cached_total", "counter", "Prompt tokens the conversation cache already held",
@@ -3740,10 +4145,10 @@ class Service:
             ("llamacpp:prompt_seconds_total", "counter", "Prompt read time", prompt_s),
             ("llamacpp:tokens_predicted_total", "counter", "Tokens generated", t["output_tokens"]),
             ("llamacpp:tokens_predicted_seconds_total", "counter", "Generation time", decode_s),
-            ("llamacpp:prompt_tokens_seconds", "gauge", "Average prompt read throughput in tokens/s",
-             prompt_n / prompt_s if prompt_s else 0),
-            ("llamacpp:predicted_tokens_seconds", "gauge", "Average generation throughput in tokens/s",
-             t["output_tokens"] / decode_s if decode_s else 0),
+            ("llamacpp:prompt_tokens_seconds", "gauge", "Average prompt read throughput in tokens/s, since the last scrape",
+             d_prompt_n / d_prompt_s if d_prompt_s > 0 else 0),
+            ("llamacpp:predicted_tokens_seconds", "gauge", "Average generation throughput in tokens/s, since the last scrape",
+             d_predicted_n / d_decode_s if d_decode_s > 0 else 0),
             ("llamacpp:requests_processing", "gauge", "Requests running", running),
             ("llamacpp:requests_deferred", "gauge", "Requests waiting their turn", s.get("queued") or 0),
             ("strata:requests_total", "counter", "Requests finished", t["requests"]),
@@ -3770,6 +4175,13 @@ class Service:
 
         busy, ctx = bool(s.get("busy")), self.reported_ctx()
         images = self.vision is not None
+        vision = {"enabled": images, "available": images, "error": None}
+        if images and getattr(self.vision, "elastic", False):
+            alive = getattr(self.vision, "alive", None)
+            vision.update(loaded=bool(alive()) if callable(alive) else not self._vision_down(),
+                          last_unload=vision_last_unload, elastic=True,
+                          elastic_mib=getattr(self.vision, "elastic_mib", None),
+                          elastic_idle_s=getattr(self.vision, "elastic_idle_s", None))
         return {
             "service": "strata", "model": self.model,
             "loaded": self.loaded(), "auto_load": hasattr(self.engine, "restart"),
@@ -3783,10 +4195,8 @@ class Service:
             "concurrency": {"serving": max(1, int(getattr(self.engine, "batch", 0) or 0)),
                             "requested": max(1, int(getattr(self.engine, "batch", 0) or 0))},
             "dialects": ["/v1/chat/completions", "/v1/messages", "/v1/responses"],
-            "vision": {"enabled": images, "available": images, "error": None,
-                       **({"loaded": not self._vision_down(), "idle_unload_s": self.vision_idle_unload_s,
-                           "last_unload": vision_last_unload}
-                          if self.vision_idle_unload_s else {})},
+            "vision": vision,
+            "image_generation": self.images.status() if self.images is not None else {"enabled": False},
             "activity": {"requests": totals["requests"] + int(busy), "in_flight": int(busy) + int(s.get("queued") or 0),
                          "last_request_at": int(last_at) if last_at else None},
             "last_timings": last_t,
@@ -3818,17 +4228,21 @@ class Service:
         tail = "" if off else EFFORT_TURN.format(EFFORT_TEXT.get(effort, EFFORT_TEXT["medium"]))
         return history + tail + full[len(mine):]
 
-    def encode_prompt(self, messages, tools, kwargs) -> list[int]:
+    def encode_prompt(self, messages, tools, kwargs, store: bool = True) -> list[int]:
         """The request's prompt: the template rendered and tokenized.  #537: a <think> / </think> written inside a
         message's text is encoded as the text it is, not as the model's reasoning markers (the template's own are).
         A control token's text (<|im_start|>, <|im_end|>, <|endoftext|>, ...) inside a message is text as well: only
-        the control tokens the template writes are control tokens."""
+        the control tokens the template writes are control tokens.  `store=False` (a token count) reuses the kept
+        prompts without adding or replacing one."""
         marked, marked_tools, changed = mark_think_literals(messages, tools, self.literals)
         prompt = self.render_prompt(marked, marked_tools, kwargs)
-        if not changed:
-            return self.tok.encode(prompt, parse_special=True)
-        prompt, plain = unmark_think_literals(prompt, self.literals)
-        return self.tok.encode(prompt, parse_special=True, plain=plain)
+        plain = ()
+        if changed:
+            prompt, plain = unmark_think_literals(prompt, self.literals)
+        if self.prompts is not None:            # #567: only what follows the last special shared with a recent prompt
+            return self.prompts.encode(prompt, plain, store)
+        return self.tok.encode(prompt, parse_special=True, plain=plain) if plain else \
+            self.tok.encode(prompt, parse_special=True)
 
     @contextlib.contextmanager
     def _turn(self, cancel=None):
@@ -3844,6 +4258,84 @@ class Service:
             yield
         finally:
             self.fifo.release()
+
+    @contextlib.contextmanager
+    def _engine_control(self, cancel=None, timeout: float | None = None, *, wait: bool = True):
+        """Keep batch slots idle for a visual or model-control operation.
+
+        With parallel requests the FIFO alone does not stop new admissions or wait for decoding slots.  A service-level
+        gate first stops new requests from registering; existing requests finish without this context holding the
+        engine's control lines.  Only then are the lines taken for the body.  Without batching this is a no-op.
+        """
+        ctl = getattr(self.engine, "ctl", None) if getattr(self.engine, "batch", 0) else None
+        if ctl is None:
+            yield
+            return
+        deadline = time.monotonic() + timeout if timeout is not None else None
+
+        def unavailable() -> ModelBusy:
+            return ModelBusy("the engine's batch slots are using the GPU; try again when they are idle")
+
+        def expired() -> bool:
+            return deadline is not None and time.monotonic() >= deadline
+
+        acquired = False
+        try:
+            with self._control_cv:
+                while self._control_active:
+                    if cancel is not None and cancel.is_set():
+                        raise ClientGone()
+                    if expired():
+                        raise unavailable()
+                    if not wait:
+                        raise unavailable()
+                    remaining = max(0.0, deadline - time.monotonic()) if deadline is not None else 0.1
+                    self._control_cv.wait(min(0.1, remaining) if remaining else 0.1)
+                self._control_active = True
+            while True:
+                if cancel is not None and cancel.is_set():
+                    raise ClientGone()
+                if expired():
+                    raise unavailable()
+                with self.status_lock:
+                    live = bool(self.live_reqs)
+                if not live:
+                    break
+                if not wait:
+                    raise unavailable()
+                time.sleep(0.05)
+            while not acquired:
+                if cancel is not None and cancel.is_set():
+                    raise ClientGone()
+                if expired():
+                    raise unavailable()
+                remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+                acquired = ctl.acquire(timeout=0 if not wait else (0.1 if remaining is None
+                                                                   else min(0.1, remaining)))
+                if not acquired and not wait:
+                    raise unavailable()
+            yield
+        finally:
+            if acquired:
+                ctl.release()
+            with self._control_cv:
+                self._control_active = False
+                self._control_cv.notify_all()
+
+    def _register_parallel_request(self, st: dict, rate, cancel, fields: dict) -> None:
+        """Register a running batch request unless an exclusive engine-control operation is active."""
+        with self._control_cv:
+            while self._control_active:
+                if cancel.is_set():
+                    self.status["queued"] -= 1
+                    raise ClientGone()
+                self._control_cv.wait(0.1)
+            self.status["queued"] -= 1
+            st.update(fields)
+            self.live_reqs[id(st)] = (st, rate)
+            self.status.update(st)
+            self.last_request_at = time.time()
+            rate.clear()
 
     def _note_unreadable_tool_images(self, messages, cancel=None):
         """A picture a tool returned (Claude Code's Read of an image file) that this server cannot read - it has no
@@ -3868,7 +4360,12 @@ class Service:
                         if src.startswith(("http://", "https://")):
                             src = fetched[item["source"]] = Vision.download(src)   # outside the FIFO, as in prepare()
                         with self._turn(cancel):  # the encoder takes its turn with the requests (see below)
-                            self.vision.encode(src)
+                            with self._engine_control(cancel):
+                                self.ensure_vision_loaded()
+                                try:
+                                    self.vision.encode(src)
+                                finally:
+                                    self._mark_vision_activity()
                     except (ValueError, OSError) as e:
                         why = str(e)
                 if why is not None:
@@ -3876,8 +4373,15 @@ class Service:
                     content[n] = {"type": "text", "text": f"[image omitted: {why}]"}
         return fetched
 
+    def forget_prompt(self, ids):
+        if self.prompts is not None:
+            self.prompts.forget(ids)
+
+
     def prepare(self, messages, tools, kwargs, max_new=None, force=None, req=None, cancel=None):
-        activity = self.image_activity() if self.vision_idle_unload_s and images_of(messages) else contextlib.nullcontext()
+        activity = (self.image_activity(cancel)
+                    if self.vision is not None and getattr(self.vision, "elastic", False) and images_of(messages)
+                    else contextlib.nullcontext())
         with activity:
             return self._prepare(messages, tools, kwargs, max_new, force, req, cancel)
 
@@ -3894,10 +4398,11 @@ class Service:
                 raise ValueError("video input is supported through POST /v1/responses only")
             return self._prepare_video(messages, tools, kwargs, max_new, force, req, budget)
         fetched = self._note_unreadable_tool_images(messages, cancel)
-        ids = self.encode_prompt(messages, tools, kwargs)
+        ids = encoded_ids = self.encode_prompt(messages, tools, kwargs)
         if force and kwargs.get("enable_thinking", True) is False:
             ids = ids + self.tok.encode(force, parse_special=True)
         self.embeddings.path = None
+        self.embeddings.keys = None
         images = images_of(messages)
         if images:
             if self.vision is None:
@@ -3918,8 +4423,13 @@ class Service:
             # "reading the prompt" with CPU and GPU busy, for good (reproduced).  So encoding takes its turn in the
             # same FIFO as the requests.
             with self._turn(cancel):
-                encoded = (self.vision.encode_all(images, cancel) if hasattr(self.vision, "encode_all")
-                           else [self.vision.encode(src) for src in images])
+                with self._engine_control(cancel):
+                    self.ensure_vision_loaded()
+                    try:
+                        encoded = (self.vision.encode_all(images, cancel) if hasattr(self.vision, "encode_all")
+                                   else [self.vision.encode(src) for src in images])
+                    finally:
+                        self._mark_vision_activity()
             # one <|image_pad|> per image -> one per image token.  Only the markers the template writes for an image
             # (right after <|vision_start|>) are images: the same text inside a message (an agent reading these docs,
             # #150) is kept as plain text, or it took an image's place and the counts no longer matched.
@@ -3951,12 +4461,16 @@ class Service:
         room = ctx - CTX_SLACK - len(ids)
         if max_new is None or max_new <= 0 or (self.fit_max_tokens and room < 1):
             if room < 1:
+                # A prompt refused for the context is not kept (#567): the client cannot resend it unchanged.  The
+                # other refusals (engine starting, images) keep it: the same prompt comes back and its encode is reused.
+                self.forget_prompt(encoded_ids)
                 raise ValueError("request exceeds the context window: "
                                  f"prompt ({len(ids)} tokens) leaves no room to answer in the context "
                                  f"({ctx}); requests are never truncated")
             max_new = room
         elif max_new > room:
             if not self.fit_max_tokens:
+                self.forget_prompt(encoded_ids)
                 raise ValueError("request exceeds the context window: "
                                  f"prompt ({len(ids)} tokens) + max tokens ({max_new}) exceeds the context "
                                  f"({ctx}); requests are never truncated. Send a smaller "
@@ -3969,6 +4483,10 @@ class Service:
             # one more for every retry of a 503.  run() deletes it; drop_embeddings() if run() never starts.
             combined = combined_embeddings_path(self.vision.dir, sum(Path(p).stat().st_size for p, _ in encoded))
             self.embeddings.path = combined             # first, so a half-written one is found as well
+            # #2228: each picture's key is its normalized bytes' hash (the encoder's file name), so the engine's
+            # conversation cache matches a picture by what it is, not by its embedding floats: a picture encoded again
+            # (an encoder restart, the cache's eviction) with other bits still matches its checkpoints
+            self.embeddings.keys = [Path(p).stem[:16] for p, _ in encoded]
             write_temporary(combined, [p for p, _ in encoded])
         if req is not None and req.get("strata_prefix") is not None:
             req["strata_prefix"] = self.resolve_prefix(req["strata_prefix"], messages, tools, kwargs, ids, bool(images))
@@ -3982,8 +4500,6 @@ class Service:
             raise video_api.VideoError("video input is supported in user messages only")
         if self.vision is None or self.vision.video_policy is None:
             raise video_api.VideoError("video is disabled; enable vision.video.enabled and rebuild strata-vision")
-        if not self.vision.video_capable:
-            raise video_api.VideoError("strata-vision does not advertise the required SVF2 video profile")
         budget.check()
         ids = self.encode_prompt(messages, tools, kwargs)
         marker = self.tok.encode("<|vision_start|><|video_pad|><|vision_end|>", parse_special=True)
@@ -4011,17 +4527,25 @@ class Service:
                 with contextlib.ExitStack() as turn:
                     with budget.stage("encode_queue"):
                         turn.enter_context(video_api.acquire(self.fifo, budget))
-                    if cached is None:
-                        with budget.stage("encode"):
-                            output, _, layout = self.vision.encode_video(packet, Path(directory) / "video.sve", budget)
-                    else:
+                    with self._engine_control(budget.cancel):
+                        with budget.stage("load"):
+                            self.ensure_vision_loaded(budget)
+                        if not self.vision.video_capable:
+                            raise video_api.VideoError(
+                                "strata-vision does not advertise the required SVF2 video profile")
+                        if cached is None:
+                            with budget.stage("encode"):
+                                output, _, layout = self.vision.encode_video(
+                                    packet, Path(directory) / "video.sve", budget)
+                    if cached is not None:
                         artifact, layout, identity = cached
                         if identity != self.vision.video_identity:
                             raise video_api.VideoError("video encoder changed; retry the request")
                         try:
                             video_api.validate_artifact(artifact, layout, budget.settings)
                         except (ValueError, OSError):
-                            raise video_store.StoreError("video_cache_corrupt", "invalid cached video artifact", 503) from None
+                            raise video_store.StoreError(
+                                "video_cache_corrupt", "invalid cached video artifact", 503) from None
                         output = Path(directory) / "video.sve"
                         with budget.stage("artifact_copy"), Path(artifact).open("rb") as source, output.open("wb") as target:
                             while chunk := source.read(65536):
@@ -4070,7 +4594,7 @@ class Service:
             with self.status_lock:
                 self._video_requests -= 1
                 self.last_request_at = time.time()
-                self._vision_last_used = time.monotonic()
+                self._mark_vision_activity()
 
     @contextlib.contextmanager
     def cached_video(self, owner, file_id, budget):
@@ -4097,13 +4621,20 @@ class Service:
                             with contextlib.ExitStack() as turn:
                                 with own_budget.stage("encode_queue"):
                                     turn.enter_context(video_api.acquire(self.fifo, own_budget))
-                                if identity != vision.video_identity:
-                                    raise video_api.VideoError("video encoder changed; retry the request")
-                                stage = "encode"
-                                encoding = time.monotonic()
-                                with own_budget.stage("encode"):
-                                    output, _, layout = vision.encode_video(packet, Path(directory) / "video.sve", own_budget)
-                                encoded = time.monotonic()
+                                with self._engine_control(own_budget.cancel):
+                                    with own_budget.stage("load"):
+                                        self.ensure_vision_loaded(own_budget)
+                                    if not vision.video_capable:
+                                        raise video_api.VideoError(
+                                            "strata-vision does not advertise the required SVF2 video profile")
+                                    if identity != vision.video_identity:
+                                        raise video_api.VideoError("video encoder changed; retry the request")
+                                    stage = "encode"
+                                    encoding = time.monotonic()
+                                    with own_budget.stage("encode"):
+                                        output, _, layout = vision.encode_video(
+                                            packet, Path(directory) / "video.sve", own_budget)
+                                    encoded = time.monotonic()
                             video_api.validate_artifact(output, layout, settings)
                             own_budget.check()
                             with own_budget.stage("artifact_store"):
@@ -4262,12 +4793,23 @@ class Service:
     def _run(self, ids, thinking, tools, max_new, sampling, cancel, force=None) -> Iterator[tuple[str, object]]:
         """Yields ("event", Event) as text arrives, then ("done", {"finish": .., "completion_tokens": ..}).
         `force` (forced_call): the opening of the call the reply must make - see prepare()."""
-        defaults = {**self.sampling_defaults, **self.shared}   # the config's, then the Chat settings shared with apps
+        # the model card's sampling for this thinking state, then the config's block, then the Chat settings shared with
+        # apps; the request's own fields win over all of them
+        defaults = {**model_card_sampling(self.model_arch, thinking), **self.sampling_defaults, **self.shared}
         if defaults:                   # the request's own fields win (explicit 0 stays greedy)
             req_values = {k: v for k, v in (sampling or {}).items() if v is not None}
             sampling = {**defaults, **req_values}
         # #123: read after the merge, so a budget shared through POST /settings is seen like the other keys
         budget = self.reasoning_budget(sampling) if thinking else None
+        if thinking and not budget and self.answer_room and max_new and max_new >= ANSWER_ROOM_MIN_CAP:
+            # 0.1.45: max_tokens counts the thinking too.  A client that caps the reply at 8192 (the desktop agent's
+            # harness sends max_completion_tokens: 8192 on every request) and a task the model thinks long about got
+            # the cut-off in the middle of the thinking and NO answer.  So thinking is closed early enough to leave
+            # the answer its quarter of the cap (the budget's wrap-up: a short closing sentence, </think>, the answer).
+            # A request with a budget of its own, or max_tokens below ANSWER_ROOM_MIN_CAP, is left as it was.
+            budget = max_new - min(max(ANSWER_RESERVE_MIN, max_new // 4), max_new // 2)
+            if max_new <= 32768: print(f"[strata] thinking limited to {budget} of max_tokens {max_new} so the answer has room "
+                  "(\"answer_room\": false in the config turns this off)", flush=True)
         if budget and max_new and max_new > 0:
             # #984: a budget at or near max_tokens never fires before the reply is cut off while still thinking, so
             # it has no answer.  Close the thinking early enough to leave room for one.
@@ -4312,6 +4854,9 @@ class Service:
         looped, next_loop_check = False, LOOP_CHECK_EVERY       # #728: reasoning that repeats whole passages
         raw_ids = []                                    # every generated id (STRATA_DEBUG: dump raw model text)
         emb, self.embeddings.path = getattr(self.embeddings, "path", None), None   # this run's to delete now
+        img_keys, self.embeddings.keys = getattr(self.embeddings, "keys", None), None
+        if emb and img_keys:
+            sampling = {**(sampling or {}), "strata_img_keys": img_keys}   # #2228: sent beside the embeddings file
         # Only a DONE line replaces engine.last, so a request that died, errored or was disconnected must not have
         # the PREVIOUS request's decode figures recorded as its own: each pass keeps its own DONE (a segment) if
         # one arrived.  A reasoning-budget continuation is another native generation, not another API request,
@@ -4376,25 +4921,25 @@ class Service:
                     try:
                         if not par:
                             self.ensure_loaded()
-                        elif not (self.loaded() and (self.vision_idle_unload_s or not self._vision_down())):
+                        elif not (self.loaded() and not self._vision_down()):
                             with self.fifo:
-                                self.ensure_loaded()
+                                with self._engine_control(cancel):
+                                    self.ensure_loaded()
                     except BaseException:
                         if par:
                             with self.status_lock:
                                 self.status["queued"] -= 1
                         raise
-                    with self.status_lock:
-                        if par:
-                            self.status["queued"] -= 1
-                        st.update(busy=True, phase="reading the prompt", prompt_tokens=len(ids),
+                    fields = dict(busy=True, phase="reading the prompt", prompt_tokens=len(ids),
                                   generated=0, started=time.time(), first_token=None, tool=None, tail="",
                                   max_tokens=max_new, reasoning_recoveries=0, thinking_budget=budget)
-                        if par:
-                            self.live_reqs[id(st)] = (st, rate)
-                            self.status.update(st)
-                        self.last_request_at = time.time()
-                        rate.clear()                    # the previous request's samples must not leak into this one
+                    if par:
+                        self._register_parallel_request(st, rate, cancel, fields)
+                    else:
+                        with self.status_lock:
+                            st.update(fields)
+                            self.last_request_at = time.time()
+                            rate.clear()
                     before = getattr(self.engine, "last", None)
                     last_print = time.time()
                     prompt, thought = ids, 0            # thought: the reasoning tokens so far (the budget's count)
@@ -4777,13 +5322,13 @@ def request_stats(segments: list[dict]) -> dict:
     if not segments:
         return {}
     result = dict(segments[-1])
-    for key in ("reused", "prompt_read"):
+    for key in ("reused", "prompt_read", "chunk"):
         if key in segments[0]:
             result[key] = segments[0][key]
         else:
             result.pop(key, None)
     for key in ("prompt_ms", "decode_ms", "generated", "drafts_offered", "drafts_accepted",
-                "hits", "lookups", "offloaded", "ram_blobs", "file_blobs", "file_mb"):
+                "hits", "lookups", "offloaded", "ram_blobs", "file_blobs", "file_mb", "experts_streamed"):
         if any(segment.get(key) is not None for segment in segments):
             result[key] = sum(segment.get(key) or 0 for segment in segments)
     return result
@@ -5603,9 +6148,24 @@ def make_handler(svc: Service):
                 self._json(200, {"status": "ok", "max_context": svc.reported_ctx(), "model": svc.model,
                                  "images": svc.vision is not None, "api_key": bool(svc.api_key),
                                  **({"videos": svc.loaded() and not getattr(svc.engine, "batch", 0)
-                                     and svc.vision.video_available()} if svc.vision is not None
-                                    and svc.vision.video_policy is not None else {}),
+                                     and getattr(svc.vision, "video_available", lambda: False)()}
+                                    if svc.vision is not None
+                                    and getattr(svc.vision, "video_policy", None) is not None else {}),
+                                 "image_generation": svc.images is not None,
                                  "loaded": svc.loaded(), "service": "strata"})
+            elif path.startswith("/v1/images/files/"):
+                # response_format url: the name (32 random hex digits) is the access, as an OpenAI image URL is
+                f = svc.images.file(path[len("/v1/images/files/"):]) if svc.images is not None else None
+                if f is None:
+                    self._json(404, {"error": {"message": "not found (the server keeps the newest images only)"}})
+                    return
+                body = f.read_bytes()
+                self.send_response(200)
+                self.send_header("Content-Type", "image/png")
+                self.send_header("Cache-Control", "private, max-age=86400")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
             elif path == "/status":
                 if not self._authorized():                  # #212: it shows the end of the last answer
                     return
@@ -5627,7 +6187,7 @@ def make_handler(svc: Service):
                              "meta": {"n_ctx": svc.reported_ctx()},
                              "architecture": {"input_modalities": (["text", "image"] +
                                                (["video"] if loaded and not getattr(svc.engine, "batch", 0)
-                                                and svc.vision.video_available() else []))
+                                                and getattr(svc.vision, "video_available", lambda: False)() else []))
                                                if svc.vision is not None else ["text"],
                                               "output_modalities": ["text"]}}
                     if not loaded and (svc.idle_unload_s or getattr(svc.engine, "unloaded", False)):
@@ -5636,7 +6196,11 @@ def make_handler(svc: Service):
                     if svc.aliases:                       # #297: the aliases, and each one listed under its own id
                         model["aliases"] = list(svc.aliases)
                     data = [model, *({**model, "id": x, "alias_of": svc.model} for x in svc.aliases)]
-                    self._json(200, {"object": "list", "data": data if loaded else []})
+                    data = data if loaded else []
+                    if svc.images is not None:            # the image model: POST /v1/images/generations
+                        data.append({"id": svc.images.model, "object": "model", "status": {"value": "loaded"},
+                                     "architecture": {"input_modalities": ["text"], "output_modalities": ["image"]}})
+                    self._json(200, {"object": "list", "data": data})
             elif path == "/props":
                 if self._authorized():
                     self._props()
@@ -5705,8 +6269,10 @@ def make_handler(svc: Service):
                 return
             if path == "/load":                              # load now, e.g. ahead of a request
                 try:
-                    svc.load(vision=True)
+                    svc.load()
                     self._json(200, {"status": "loaded"})
+                except ModelBusy as e:
+                    self._json(409, {"error": {"type": "model_busy", "message": str(e)}})
                 except (GpuBusy, EngineDied, EngineStuck) as e:
                     ra = getattr(e, "retry_after", None)       # #1997 / #1994: a refusal that is worth retrying
                     self._json(503, {"error": {"type": "server_error", "message": str(e)}},
@@ -5739,7 +6305,8 @@ def make_handler(svc: Service):
                             with svc.status_lock:
                                 if svc.status.get("busy") or svc.status.get("queued"):
                                     raise ModelBusy("a request is running or queued")
-                            svc.ensure_loaded(vision=True)
+                            with svc._engine_control():
+                                svc.ensure_loaded()
                             svc.last_request_at = time.time()
                         finally:
                             svc.fifo.release()
@@ -5776,6 +6343,8 @@ def make_handler(svc: Service):
                     self._anthropic(req)
                 elif path == "/v1/messages/count_tokens":
                     self._count_tokens(req)
+                elif path == "/v1/images/generations":
+                    self._images(req)
                 else:
                     self._json(404, {"error": {"message": "not found"}})
             except EngineNonFinite as e:                    # #879, twice: not the request's fault
@@ -5830,6 +6399,33 @@ def make_handler(svc: Service):
                         record["state"] = "error" if record.get("error") else record.get("outcome", "completed")
                     svc.request_trace.record = None
 
+        def _images(self, req):
+            """POST /v1/images/generations (serve/images.py): one sd-cli job in the GPU's turn."""
+            gen = svc.images
+            if gen is None:
+                self._json(404, {"error": {"type": "invalid_request_error", "code": "images_not_set_up",
+                                           "message": "image generation is not set up on this server (run setup "
+                                                      "with --images qwen-image)"}})
+                return
+            job = images_api.parse_request(req, gen.cfg)        # ImageRequestError (a ValueError): 400
+            svc.last_request_at = time.time()
+            cancel = threading.Event()
+            self._watch_client(cancel)
+            print(f"[strata] image: {job['width']}x{job['height']}, n={job['n']}, {job['steps']} steps, "
+                  f"seed {job['seed']}", flush=True)
+            try:
+                with images_api.gpu_turn(svc, gen, job, cancel) as policy:
+                    images, figures = gen.run(job, cancel)
+            except images_api.ImageJobFailed as e:
+                self._json(500, {"error": {"type": "server_error", "code": "image_generation_failed",
+                                           "message": str(e)}})
+                return
+            figures["gpu_policy"] = policy
+            print(f"[strata] image done in {figures['seconds']:.1f} s ({policy})", flush=True)
+            host = self.headers.get("Host") or f"{self.server.server_address[0]}:{self.server.server_address[1]}"
+            scheme = "https" if (self.headers.get("X-Forwarded-Proto") or "").lower() == "https" else "http"
+            self._json(200, gen.response(images, job, figures, f"{scheme}://{host}"))
+
         def _props(self):
             model = parse_qs(urlsplit(self.path).query).get("model", [svc.model])[0]
             if model not in svc.model_names():
@@ -5838,7 +6434,7 @@ def make_handler(svc: Service):
             if not svc.loaded() and not getattr(svc.engine, "unloaded", False):
                 self._json(503, {"error": {"message": "the engine is not running"}})
                 return
-            defaults = {**svc.sampling_defaults, **svc.shared}
+            defaults = {**model_card_sampling(svc.model_arch, True), **svc.sampling_defaults, **svc.shared}
             names = {"repetition_penalty": "repeat_penalty", "penalty_last_n": "repeat_last_n"}
             params = {names.get(k, k): v for k, v in defaults.items()
                       if k in ("temperature", "top_p", "top_k", "min_p", "seed", "repetition_penalty",
@@ -6244,10 +6840,11 @@ def make_handler(svc: Service):
                     raise ResponsesError("video is disabled; enable vision.video.enabled", "input", "video_unavailable")
                 if getattr(svc.engine, "batch", 0):
                     raise ResponsesError("video input is not supported with engine batching", "input", "video_unavailable")
-                if not svc.loaded() or (not svc.vision_idle_unload_s and not svc.vision.alive()):
+                can_wake = bool(getattr(svc.vision, "elastic", False))
+                if not svc.loaded() or (not can_wake and not svc.vision.alive()):
                     raise ResponsesError("load the model and vision encoder before sending video", "input",
                                          "video_unavailable", status=503)
-                if not svc.vision.video_capable and (not svc.vision_idle_unload_s or svc.vision.alive()):
+                if not svc.vision.video_capable and not can_wake:
                     raise ResponsesError("rebuild strata-vision with SVF2 video support", "input", "video_unavailable")
                 tools, names, _ = responses_api.request_tools(req)
             except video_store.StoreError as e:
@@ -6275,7 +6872,8 @@ def make_handler(svc: Service):
             box, ready = {}, threading.Event()
             try:
                 with svc.status_lock:
-                    if svc._unloading or not svc.loaded() or (not svc.vision_idle_unload_s and not svc.vision.alive()):
+                    can_wake = bool(getattr(svc.vision, "elastic", False))
+                    if svc._unloading or not svc.loaded() or (not can_wake and not svc.vision.alive()):
                         raise ResponsesError("load the model and vision encoder before sending video", "input",
                                              "video_unavailable", status=503)
                     svc._video_requests += 1
@@ -6358,6 +6956,12 @@ def make_handler(svc: Service):
             except ConnectionError:
                 cancel.set()
                 self._note(outcome="disconnected")
+            except ModelBusy as e:
+                cancel.set()
+                if getattr(self, "video_stream_started", False):
+                    self._responses_failed(asm, str(e), "model_busy", send)
+                else:
+                    self._json(409, responses_error_body(str(e), "server_error", code="model_busy"))
             except Exception as e:
                 if getattr(self, "video_stage", None) == "load" and isinstance(e, video_api.VideoError):
                     code = "video_load_cancelled" if cancel.is_set() else "video_load_timeout"
@@ -6399,7 +7003,7 @@ def make_handler(svc: Service):
                         if admitted:
                             svc._video_requests -= 1
                             svc.last_request_at = time.time()
-                            svc._vision_last_used = time.monotonic()
+                            svc._mark_vision_activity()
                     budget.trace.event("cleanup", event="released", scope="request")
 
         def _responses_failed(self, asm, message, code, send):
@@ -6415,7 +7019,7 @@ def make_handler(svc: Service):
             responses_api.check_request(req)
             messages = responses_api.input_messages(req)
             tools, names, skipped = responses_api.request_tools(req)
-            kw = responses_api.template_kwargs(req, svc.shared)
+            kw = responses_api.template_kwargs(req, {"reasoning_effort": svc.effort_default()})
             try:
                 self._no_local_images(messages)              # as on the chat route: no file read for a foreign page
             except ValueError as e:
@@ -6448,24 +7052,24 @@ def make_handler(svc: Service):
                 video_budget.check()
                 if not svc.loaded():
                     raise EngineStarting("load the model and vision encoder before sending video")
-                if svc.vision_idle_unload_s:
-                    self.video_stage = "load"
-                    try:
-                        with contextlib.ExitStack() as turn:
-                            with video_budget.stage("load_queue"):
-                                turn.enter_context(video_api.acquire(svc.fifo, video_budget))
-                            with video_budget.stage("load"):
+                self.video_stage = "load"
+                try:
+                    with contextlib.ExitStack() as turn:
+                        with video_budget.stage("load_queue"):
+                            turn.enter_context(video_api.acquire(svc.fifo, video_budget))
+                        with video_budget.stage("load"):
+                            with svc._engine_control(video_budget.cancel):
                                 svc.ensure_vision_loaded(video_budget)
-                    except video_api.VideoError:
-                        raise
-                    except Exception as e:
-                        raise ResponsesError(str(e), "input", "video_load_failed", status=503) from e
-                    self.video_stage = "prepare"
-                elif svc._vision_down():
-                    raise EngineStarting("load the model and vision encoder before sending video")
+                except (ModelBusy, ClientGone):
+                    raise
+                except video_api.VideoError:
+                    raise
+                except Exception as e:
+                    raise ResponsesError(str(e), "input", "video_load_failed", status=503) from e
+                self.video_stage = "prepare"
                 svc.last_request_at = time.time()
             else:
-                svc.load()
+                svc.load(cancel)
             # #924 (opt-in): a Codex compaction request is rendered with its conversation's tools, so its prompt
             # starts as the cached one did; the parser and the response keep the request's own tools
             shown = responses_api.prompt_tools(req, tools) if svc.codex_compaction_cache else tools
@@ -6505,7 +7109,7 @@ def make_handler(svc: Service):
             messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked)
             stop_strings(req)                                 # the same 400 as the request itself would get
             check_request_sampling(req)                       # ... likewise a sampling field of the wrong type
-            self._json(200, {"input_tokens": len(svc.encode_prompt(messages, tools, kw))})
+            self._json(200, {"input_tokens": len(svc.encode_prompt(messages, tools, kw, store=False))})
 
         def _anthropic(self, req):
             svc.load()
@@ -6795,6 +7399,16 @@ def api_key_of(value):
     return key.strip()
 
 
+def without_legacy_public_key(value):
+    """Drop the old public placeholder from a string, comma-separated string, or list of configured keys."""
+    if isinstance(value, list):
+        return [key for key in value if key != LEGACY_PUBLIC_API_KEY]
+    if isinstance(value, str) and "," in value:
+        return ",".join(key.strip() for key in value.split(",")
+                        if key.strip() and key.strip() != LEGACY_PUBLIC_API_KEY)
+    return "" if value == LEGACY_PUBLIC_API_KEY else value
+
+
 def key_matches(given: str, key) -> bool:
     """given: a header's value as http.server read it, each byte one character.  A key with characters outside ASCII
     arrives as UTF-8 from most clients and as Latin-1 from some; the right key passes in both forms (#725: the
@@ -6905,6 +7519,43 @@ def clean_shared_defaults(d) -> dict:
             raise ValueError(f"unknown setting {key!r}")
         out[key] = float(value) if key in ("temperature", "top_p") else value
     return out
+
+
+def split_joined_args(cfg: dict) -> None:
+    """#2267: an engine option written as ONE element of the config's "args" - "--ple-io mmap" or "--ple-io=mmap" - reaches
+    the engine as a single argument ("unknown argument: --ple-io mmap"; the usual form is two elements, "--ple-io",
+    "mmap").  Recommend, never force: such an element is split into the flag and its value, and said at startup.  Only an
+    element that starts with a flag name (--letters-digits-dashes) followed by a space or "=" is touched, and never one
+    that sits in the value place of the flag before it."""
+    args = cfg.get("args")
+    if not isinstance(args, list):
+        return
+    out, changed = [], []
+    for a in args:
+        m = re.match(r"^(--[A-Za-z0-9][A-Za-z0-9-]*)(?:\s+|=)(\S.*)$", a) if isinstance(a, str) else None
+        prev = out[-1] if out else None
+        in_value_place = isinstance(prev, str) and re.match(r"^--[A-Za-z0-9][A-Za-z0-9-]*$", prev) is not None
+        if m is None or in_value_place:
+            out.append(a)
+            continue
+        out += [m.group(1), m.group(2).strip()]
+        changed.append(a)
+    if changed:
+        cfg["args"] = out
+        print("[strata] the config's args hold " + ", ".join(repr(c) for c in changed) + " as one element each: split into the "
+              'flag and its value (write them as two elements, e.g. "--ple-io", "mmap")', flush=True)
+
+
+def read_config(path) -> dict:
+    """The run config's JSON.  A mistake in it (a missing comma between two args, a trailing comma) is said with its
+    place in the file instead of a traceback (#2267: editing "args" by hand is where it happens)."""
+    text = Path(path).read_text(encoding="utf-8-sig")   # Notepad adds a BOM
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as e:
+        raise SystemExit(f"[strata] {path} is not valid JSON: {e.msg} at line {e.lineno}, column {e.colno}. Check the commas "
+                         'between the entries of "args" (each option and each value is its own quoted entry, e.g. '
+                         '"--ple-io", "mmap",) and that no entry is followed by a comma at the end of a list.') from None
 
 
 def lift_reasoning_effort_arg(cfg: dict) -> None:
@@ -7085,6 +7736,34 @@ def check_request_sampling(req) -> None:
             raise ValueError(f"{key}: {'an integer' if integer else 'a number'}")
 
 
+# the API's model name per model family (the GGUF architecture, "arch" in the config) when the config names none
+FAMILY_MODEL_NAMES = {"qwen4exp": "qwen3.8-flash-next", "qwen35moe": "qwen3.6-35b-a3b"}
+
+
+# The sampling each model card recommends ("Best Practices"), used when neither the request, the Chat settings nor the
+# run config's `sampling` block says otherwise.  Greedy is only for a request or config that asks for temperature 0.
+# min_p 0, repetition_penalty 1 and presence_penalty 0 are the engine's own "off", so they are not listed.
+MODEL_CARD_SAMPLING = {
+    # Qwen3.8-Flash-Next (and Gyro, the same base model)
+    "qwen4exp": {"thinking": {"temperature": 1.0, "top_p": 0.95, "top_k": 20},
+                 "instruct": {"temperature": 0.7, "top_p": 0.8, "top_k": 20, "presence_penalty": 1.5}},
+    # Qwen3.6-35B-A3B: the general-task sets (the card's precise-coding set is temperature 0.6, presence_penalty 0)
+    "qwen35moe": {"thinking": {"temperature": 1.0, "top_p": 0.95, "top_k": 20, "presence_penalty": 1.5},
+                  "instruct": {"temperature": 0.7, "top_p": 0.8, "top_k": 20, "presence_penalty": 1.5}},
+}
+
+
+def model_card_sampling(arch, thinking) -> dict:
+    """The model card's sampling for the family `arch` and the thinking state ({} for an unknown or unset family)."""
+    sets = MODEL_CARD_SAMPLING.get(arch) if arch else None
+    return dict(sets["thinking" if thinking else "instruct"]) if sets else {}
+
+
+def default_model_name(cfg: dict) -> str:
+    """The config's "model_name", else its family's name ("arch": qwen4exp, qwen35moe), else Flash-Next's."""
+    return cfg.get("model_name") or FAMILY_MODEL_NAMES.get(cfg.get("arch") or "qwen4exp", "qwen3.8-flash-next")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--engine", choices=["mock", "strata"], default="mock")
@@ -7092,7 +7771,7 @@ def main() -> int:
                                      "written by setup.py")
     ap.add_argument("--host", default=None,
                     help="the address to listen on: 0.0.0.0 = also other devices on your network (the default here, "
-                         "with the default API key), 127.0.0.1 = this PC only; also \"host\" in the config")
+                         "with a generated API key), 127.0.0.1 = this PC only; also \"host\" in the config")
     ap.add_argument("--script", action="append",
                     help="the mock engine's answer (default: a short greeting); given more than once, requests get "
                          "them in turn and the last one repeats")
@@ -7132,7 +7811,8 @@ def main() -> int:
                          "each, requests spread over them (also \"replicas\" in the config: a number, or "
                          "[{\"gpus\": [0, 1]}, {\"gpus\": [2, 3]}])")
     a = ap.parse_args()
-    cfg = json.loads(Path(a.config).read_text(encoding="utf-8-sig")) if a.config else {}   # Notepad adds a BOM
+    cfg = read_config(a.config) if a.config else {}
+    split_joined_args(cfg)
     lift_reasoning_effort_arg(cfg)
     if a.replicas is not None:
         cfg["replicas"] = a.replicas
@@ -7170,16 +7850,22 @@ def main() -> int:
             print(f"[strata] sampling defaults from the config: {pretty}", flush=True)
         lazy = a.lazy or cfg.get("lazy_load") is True
         if cfg.get("vision"):
-            if cfg["vision"].get("idle_unload_s"):
-                args = cfg.get("args", [])
-                if any(flag in args for flag in ("--batch", "--slots")) or parallel_args(cfg, args):
-                    ap.error("vision.idle_unload_s does not support engine batching")
-            print("loading the vision encoder ..." if not lazy else
-                  "vision encoder unloaded; it starts with the model ...", flush=True)
             # relative paths are the config's cwd's, as for the engine below
             vcfg = {k: (os.path.abspath(os.path.join(cfg.get("cwd") or ".", v))
                         if k in ("exe", "mmproj", "model") and isinstance(v, str) and not os.path.isabs(v) else v)
                     for k, v in cfg["vision"].items()}
+            if vcfg.get("idle_unload_s"):
+                # Compatibility spelling: both keys select the same upstream
+                # elastic lifecycle instead of maintaining a second idle worker.
+                print('[strata] vision.idle_unload_s is deprecated; using the vision.elastic lifecycle',
+                      flush=True)
+            elastic = vcfg.get("elastic") is True or bool(vcfg.get("idle_unload_s"))
+            print("the vision encoder starts with the first image or video (elastic) ..." if elastic else
+                  "loading the vision encoder ..." if not lazy else
+                  "vision encoder unloaded; it starts with the model ...", flush=True)
+            if elastic and cfg.get("vram_elastic") is not True:
+                print('[strata] vision.elastic has no "vram_elastic": the encoder lifecycle is elastic, but the '
+                      "expert cache cannot give or reclaim its VRAM", flush=True)
             vision = Vision(vcfg, log=open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None,
                             env=vision_env(cfg, env), lazy=lazy)
         print("model unloaded; the first request loads it ..." if lazy else
@@ -7228,10 +7914,28 @@ def main() -> int:
     # the model's own chat template (exported with its tokenizer), else the original model's
     tpl = tpath / "chat_template.jinja"
     svc = Service(engine, tok, ChatTemplate(tpl if tpl.exists() else ROOT / "serve/chat_template.jinja"),
-                  model_name=cfg.get("model_name", "qwen3.8-flash-next"), vision=vision,
+                  model_name=default_model_name(cfg), vision=vision,
                   sampling_defaults=sampling_defaults,
                   fit_max_tokens=a.fit_max_tokens or cfg.get("fit_max_tokens") is True)
+    if a.engine == "strata":                            # the model card's sampling when nothing else is said (see MODEL_CARD_SAMPLING)
+        svc.model_arch = cfg.get("arch") or "qwen4exp"
+    svc.answer_room = cfg.get("answer_room") is not False
     svc.reasoning_close_retry = cfg.get("reasoning_close_retry") is True    # #1053: opt-in, off by default
+    if cfg.get("images"):                               # image generation (serve/images.py), set up by setup --images
+        icfg = {k: (os.path.abspath(os.path.join(cfg.get("cwd") or ".", v))
+                    if k in ("exe", "diffusion_model", "vae", "llm", "out_dir") and isinstance(v, str)
+                    and not os.path.isabs(v) else v)
+                for k, v in cfg["images"].items()}
+        try:
+            svc.images = images_api.ImageGen(icfg, log=open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None)
+        except ValueError as e:
+            raise SystemExit(f"[strata] config: {e}")
+        gone = svc.images.missing()
+        if gone:
+            print(f"[strata] image generation: missing {', '.join(gone)} - requests fail until setup --images has run "
+                  "again", flush=True)
+        print(f"[strata] image generation: {svc.images.model} {icfg.get('quant') or ''} on "
+              f"{icfg.get('backend') or '?'} (POST /v1/images/generations; GPU policy {svc.images.policy})", flush=True)
     if cfg.get("prevent_sleep") is not None and not isinstance(cfg["prevent_sleep"], bool):
         raise SystemExit(f"[strata] config \"prevent_sleep\" must be true or false, not {cfg['prevent_sleep']!r}")
     from serve.keepawake import KeepAwake
@@ -7263,14 +7967,25 @@ def main() -> int:
     except ValueError as e:
         print(f'[strata] {e}: set a key, or leave --api-key / STRATA_API_KEY / "api_key" out', file=sys.stderr)
         return 2
-    if not svc.api_key and "api_key" in cfg:             # #569: written, but empty: the server has none (a warning, not a stop)
+    cleaned_key = without_legacy_public_key(svc.api_key)
+    if cleaned_key != svc.api_key:
+        if cleaned_key:
+            svc.api_key = cleaned_key
+            print("[strata] removed the old public API key and kept the other configured keys", file=sys.stderr,
+                  flush=True)
+        else:
+            svc.api_key = "sk-" + secrets.token_urlsafe(24)
+            print(f'[strata] rotated the old public key: this process now uses "{svc.api_key}". Set "api_key" in the '
+                  "config (or --api-key / $STRATA_API_KEY) to keep your own key across starts",
+                  file=sys.stderr, flush=True)
+    elif not svc.api_key and a.host not in LOOPBACK_NAMES:  # this fork: 0.0.0.0 is the default, so a key is always set
+        svc.api_key = "sk-" + secrets.token_urlsafe(24)
+        print(f'[strata] no API key was set: listening on {a.host} with this process\'s generated key '
+              f'"{svc.api_key}". Set "api_key" in the config (or --api-key / $STRATA_API_KEY) to keep one across '
+              "starts; the chat page's API key box takes it once", file=sys.stderr, flush=True)
+    elif not svc.api_key and "api_key" in cfg:           # #569: written empty on a loopback server: a warning, not a stop
         print("[strata] the api_key in the config is empty: this server has no API key (anyone who can reach it can "
               "use it); set one, or leave api_key out", file=sys.stderr, flush=True)
-    if not svc.api_key and a.host not in LOOPBACK_NAMES:  # this fork: 0.0.0.0 is the default, so a key is always set
-        svc.api_key = DEFAULT_API_KEY
-        print(f'[strata] no API key was set: listening on {a.host} with the default "{DEFAULT_API_KEY}". '
-              'Change "api_key" in the config file (or --api-key / $STRATA_API_KEY); the chat page\'s API key '
-              "box takes it once", file=sys.stderr, flush=True)
     files_config = cfg.get("video_files")
     if files_config is not None:
         if not isinstance(files_config, dict) or not isinstance(files_config.get("enabled", False), bool):
@@ -7326,6 +8041,11 @@ def main() -> int:
     if not isinstance(recovery, bool):
         raise SystemExit(f"[strata] config \"tool_call_recovery\" must be true or false, not {recovery!r}")
     svc.tool_call_recovery = recovery
+    etu = cfg.get("env_to_user", False)                # opt-in: see frontend._env_to_user
+    if not isinstance(etu, bool):
+        raise SystemExit(f"[strata] config \"env_to_user\" must be true or false, not {etu!r}")
+    import serve.frontend as _frontend
+    _frontend.ENV_TO_USER = etu
     rs = cfg.get("repeat_stop_tokens", REPEAT_STOP_TOKENS)   # #606: opt-out with 0
     if isinstance(rs, bool) or not isinstance(rs, int) or rs < 0:
         raise SystemExit(f"[strata] config \"repeat_stop_tokens\" must be a whole number >= 0 (0 = off), not {rs!r}")
@@ -7373,6 +8093,7 @@ def main() -> int:
         atexit.register(hub.close)                      # the servers Strata started end with it
     httpd = serve(svc, host=a.host, port=a.port)
     svc.start_idle_unload()
+    svc.start_vision_idle()
     here = "127.0.0.1" if a.host in ("0.0.0.0", "", "::") else a.host
     print(f"ready: http://{here}:{a.port}/v1  (OpenAI: /v1/chat/completions, Anthropic: /v1/messages, "
           f"context {engine.max_context} tokens{', images on' if vision else ''}"

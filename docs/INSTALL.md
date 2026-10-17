@@ -17,7 +17,7 @@ this for you with [AI_SETUP.md](AI_SETUP.md).
 | **RAM** | Enough for the size you pick ([which model](MODELS.md#pick-by-ram)); **64 GB** runs every size. A big GPU makes up for less RAM - the [low-RAM mode](MODELS.md#a-big-graphics-card-and-little-ram). |
 | **CPU** | x86-64 with AVX2 (any Intel/AMD desktop CPU from the last ~8 years). AVX-512 (Ryzen 7000/9000) is a bit faster. Older CPUs without AVX2 are experimental and slow: [Older CPUs](#older-cpus-experimental). |
 | **Disk** | ~70-80 GB free for the model, ~6 GB for the MTP layer (+1 GB with images). **Q2_0 on an AVX-512 CPU** also writes a one-time ~40 GB copy of its experts for the fast CPU kernel. On Linux with an AMD card, ROCm takes ~10 GB more when setup installs it. An NVMe SSD is strongly recommended: it makes the first start much faster. |
-| **OS** | Windows 10/11, or Linux (Ubuntu 22.04/24.04 get everything installed automatically). |
+| **OS** | Windows 10/11, or Linux (Ubuntu 22.04/24.04 and Debian 12/13 get everything installed automatically). |
 | **Driver** | **NVIDIA:** a current driver, version 580 or newer ([nvidia.com/drivers](https://www.nvidia.com/drivers) or the NVIDIA App). **AMD:** on Linux the kernel's amdgpu driver (no ROCm install needed); on Windows a current AMD Software: Adrenalin Edition driver ([amd.com/support](https://www.amd.com/en/support)). |
 
 The driver is the only thing you install yourself. Everything else - Python, the engine, the model - is set up for
@@ -35,7 +35,8 @@ the engine for your GPU (asks first; 20-40 minutes once). More: [details](DETAIL
 3. Answer a few questions - or just press Enter each time for the recommended choice ([the questions](#setups-questions)).
 
 Then it downloads everything (the model is ~70 GB, so the first time takes a while - you can stop and it picks up
-where it left off) and **starts the model**. Your browser opens the Strata app at `http://127.0.0.1:8080`.
+where it left off) and **starts the model**. Setup prints the local address and a generated API key but does not open
+a browser; open `http://127.0.0.1:8080` yourself.
 
 > **While the model starts, your PC can be slow or stop responding for 1-3 minutes** (longest the first time): Strata
 > loads 35-55 GB into your RAM and locks part of it for the graphics card. That's normal - wait, and don't close the
@@ -56,6 +57,12 @@ The same questions, the same automatic install (it uses `sudo apt` for Python an
 the build tools), and the same start: `http://127.0.0.1:8080`. Later runs of `./setup.sh` (or `./run-<model>.sh`)
 start the model directly; `./setup.sh --setup` installs another model or changes the settings. Other distributions,
 WSL and compiling: [details](DETAILS.md#linux).
+
+On Nix/NixOS, you can use the flake:
+
+```bash
+nix develop -c ./setup.sh
+```
 
 ## AMD cards
 
@@ -245,7 +252,7 @@ START-HERE.bat --vram-reserve-mib 2048          leave 2 GB of VRAM free for othe
 START-HERE.bat --no-browser                     do not open the chat page when the model is ready (remembered;
                                                 --browser undoes it)
 START-HERE.bat --setup --backend hip            the AMD engine on a PC that also has an NVIDIA card
-START-HERE.bat --setup --host 0.0.0.0 --api-key <secret>     reachable from other devices, with a key
+START-HERE.bat --setup --host 127.0.0.1                      keep the server on this PC only
 START-HERE.bat --calibrate                      tune the engine for this PC (about 15-30 minutes, longer on a slow card), then start
 START-HERE.bat --check                          only check this PC
 ```

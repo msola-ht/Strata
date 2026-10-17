@@ -3,15 +3,16 @@
 This page is written for an AI coding assistant (Claude Code, Cursor, Codex, GitHub Copilot, ...) that a user asked to
 set up Strata on their PC. Strata runs the Qwen3.8-Flash-Next model locally on one NVIDIA or AMD graphics card plus
 system RAM, and serves an OpenAI- and Anthropic-compatible API on `http://127.0.0.1:8080`. The human-oriented
-version of everything below is [INSTALL.md](INSTALL.md).
+version of everything below is [INSTALL.md](INSTALL.md). This fork listens on `0.0.0.0` by default and generates a
+private API key during setup, so other devices on the local network can connect without a public placeholder secret.
 
 Work through the steps in order. Tell the user what you are doing in plain words; they may not be technical.
 
 ## 0. Ground rules
 
-- **Never expose the server without an API key.** Keep the default `--host 127.0.0.1`. Only if the user asks for
-  access from other devices, use `--host 0.0.0.0` **together with** `--api-key <a long random secret>`, and give the
-  user the key. Never put a tunnel or port forward in front of a server without a key.
+- **Never expose the server without an API key.** New setups use `--host 0.0.0.0` with a generated private key.
+  Give the user the key printed by setup or stored as `"api_key"` in `strata-<model>.json`. If the user does not need
+  LAN access, set `--host 127.0.0.1`. Never put a tunnel or port forward in front of a server without a key.
 - Do not change the user's system beyond what setup does (setup installs Python for the user account if needed,
   and everything else inside the Strata folder and its `Strata-data` folder). Ask before installing drivers.
 - The model download is ~70 GB (94 GB for Unsloth's UD-IQ4_XS, 111 GB for UD-Q4_K_XL). Confirm the user is fine with that before you
@@ -50,7 +51,7 @@ Requirements (details: [INSTALL.md](INSTALL.md#what-you-need)):
   driver. If the driver is missing or too old, tell the user to update it (NVIDIA App / nvidia.com/drivers, or AMD
   Software) and restart; do not install drivers yourself unless they ask.
 - **RAM:** 32 GB or more (see step 3). **Disk:** ~80 GB free, ideally on an NVMe SSD. **CPU:** x86-64 with AVX2. Without AVX2 (Xeon E5 v1/v2 and older) setup still installs, as an experimental and slow build it compiles on the PC (10-20 minutes): tell the user that before starting ([INSTALL.md](INSTALL.md#older-cpus-experimental)).
-- **OS:** Windows 10/11 or Linux (Ubuntu 22.04/24.04 are fully automatic).
+- **OS:** Windows 10/11 or Linux (Ubuntu 22.04/24.04 and Debian 12/13 are fully automatic; Debian 13 gets the oldest CUDA 13 its NVIDIA repo has, currently 13.1).
 
 If the PC does not meet them, say which part is missing and stop.
 
@@ -100,7 +101,7 @@ The flags (all of them: `START-HERE.bat --help`):
 | `--backend cuda\|hip` | NVIDIA or AMD engine; chosen by itself on a PC with only one kind of card |
 | `--data-dir PATH` | where the 70-120 GB of model files go |
 | `--port N` | the server port (default 8080) |
-| `--host H --api-key K` | listen beyond this PC; **only together with a key** |
+| `--host H --api-key K` | choose the listen address and key; new non-loopback setups generate a key automatically |
 | `--no-start` | install only, do not start the server |
 | `--setup` | install another model or change settings of an installed one |
 | `--check` | only check the PC |
@@ -141,8 +142,8 @@ Linux:                 nohup ./run-iq2_xs.sh > strata-server.out 2>&1 &
 ```
 
 Or `START-HERE.bat` / `./setup.sh` without flags, which starts the installed model (it asks which one when several are
-installed; add `--yes` to take the first). The server opens the user's browser on `http://127.0.0.1:8080` when it is
-ready. Closing its window (or stopping the process) stops the model.
+installed; add `--yes` to take the first). The server prints the local address and API key but does not open a browser.
+Open `http://127.0.0.1:8080` yourself. Closing its window (or stopping the process) stops the model.
 
 ## 7. Verify
 
@@ -160,19 +161,19 @@ curl http://127.0.0.1:8080/v1/models
 curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/json" -d "{\"model\": \"strata\", \"messages\": [{\"role\": \"user\", \"content\": \"Say hello in five words.\"}], \"max_tokens\": 64, \"reasoning_effort\": \"none\"}"
 ```
 
-With an API key, add `-H "Authorization: Bearer <key>"`. The server window prints a `ready: http://127.0.0.1:8080/v1`
-line when it is ready; the engine log is `strata-<model>.log` in the Strata folder.
+Use the configured key for these requests: add `-H "Authorization: Bearer <key>"`. Setup prints the key and saves it
+in `strata-<model>.json`. The server window prints a `ready: http://127.0.0.1:8080/v1` line when it is ready; the
+engine log is `strata-<model>.log` in the Strata folder.
 
 ## 8. Connect the user's apps
 
 - **Browser:** `http://127.0.0.1:8080` - Chat, a live Monitor, and About (settings and addresses).
-- **Any OpenAI-compatible app or agent:** base URL `http://127.0.0.1:8080/v1`, any API key (or the configured one),
-  any model name.
+- **Any OpenAI-compatible app or agent:** base URL `http://127.0.0.1:8080/v1`, the configured API key, any model name.
 - **Anthropic-compatible apps:** `http://127.0.0.1:8080/v1/messages`.
 - **Codex CLI and other Responses API apps:** `http://127.0.0.1:8080/v1/responses` (stateless; Codex's
   `config.toml`: [DETAILS.md](DETAILS.md#the-responses-api-and-codex-cli)).
 - **Claude Code:** `ANTHROPIC_BASE_URL=http://127.0.0.1:8080`, `ANTHROPIC_MODEL` set to a Claude model name it knows
-  (Strata ignores the name), and any `ANTHROPIC_AUTH_TOKEN` (or the configured key).
+  (Strata ignores the name), and the configured key as `ANTHROPIC_AUTH_TOKEN`.
 - **Thinking level:** `"reasoning_effort": "none" | "low" | "medium" | "high"` (default high).
 - Strata answers one request at a time; `"parallel": N` in the model's config (or setup `--parallel N`) decodes up to
   N together ([BATCHING.md](BATCHING.md)). API details: [DETAILS.md](DETAILS.md#using-it).
