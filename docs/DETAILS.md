@@ -655,36 +655,40 @@ the OS file cache, so loading again takes seconds while that RAM is not needed e
 16 GB with Q2_0 in the low-RAM mode: unloading takes ~0.3 s, and a request to an unloaded model answered after
 4.6 s (text) or 14.7 s (a picture, image encoder on the CPU).
 
-**Release only the idle vision encoder (optional).** Add `"idle_unload_s": 600`
-inside the existing `"vision"` configuration object. The default is `0` (disabled);
-the value must be a finite, non-negative number of seconds. This setting is read
-at server startup and is separate from the top-level `idle_unload_s`. It is not
-supported with engine batching; startup rejects that combination.
+**Keep the vision encoder elastic (optional).** Add `"elastic": true` inside the
+existing `"vision"` configuration object and choose an idle interval with
+`"elastic_idle_s": 600` (default 120). With top-level `"vram_elastic": true`,
+the expert cache gives the encoder room before it starts and takes that VRAM
+back after it stops. Without `vram_elastic`, the same lifecycle still starts
+and stops the encoder, but the expert cache cannot give or reclaim that room.
+
+The older `"idle_unload_s": 600` spelling inside `"vision"` is accepted as a
+compatibility alias for the same lifecycle and maps to
+`"elastic_idle_s": 600`. It does not start a second idle worker. Do not set
+both idle intervals to different values; startup rejects that ambiguity. This
+vision setting is separate from the top-level model `idle_unload_s`.
 
 While the text engine stays resident, text requests do not wake the sleeping
 encoder or refresh its visual activity timer. Image requests, including tool
-images, wake it before preprocessing. Video Responses requests wake it within
+images, start it before preprocessing. Video Responses requests start it within
 the video's existing deadline and cancellation budget. The timer waits for a
 safe engine turn and for visual work to finish; it never interrupts generation.
 Images remain protected until their cached embeddings have been copied into a
 request-owned file. Videos remain protected through generation and cleanup.
 File uploads and lookups do not count as visual activity.
 
-`POST /load` and `POST /v1/load` explicitly load both processes. A full cold start
-also retains the original vision-first order, even when triggered by text: the
-text engine sizes its cache after the encoder has taken its VRAM. Video requests
-still require the text engine to be loaded; independent vision wake does not
-introduce automatic full-model cold starts on that endpoint. Encoder-only wake
-does not run `before_load` or apply the full-model `min_free_vram_mib` threshold.
-It uses the VRAM released by the encoder; if another program or an explicit
-elastic-cache expansion has consumed it, startup can fail. Strata does not resize
-or restart the resident text engine to make room automatically.
+`POST /load` and `POST /v1/load` load the text engine, but do not start an
+elastic vision encoder; the next image or video does. A non-elastic encoder
+still keeps the original vision-first cold-start ordering. Video requests
+require the text engine to be loaded. Elastic vision startup does not run
+`before_load` or apply the full-model `min_free_vram_mib` threshold. It first
+asks the expert cache to make room; if the cache cannot resize, the encoder
+starts anyway when free VRAM permits.
 
 With this option enabled, `/v1/status` adds `vision.loaded` and
-`vision.idle_unload_s`. Logs report `vision stage=load elapsed_s=... ready=...`
-and confirmed `vision stage=idle_unload elapsed_s=...`. A process that fails to
-exit remains owned and blocks replacement; it is not reported as successfully
-unloaded. The idle worker stops when its HTTP server closes.
+`vision.elastic_idle_s`. Logs report the encoder start and confirmed
+`vision stage=idle_unload elapsed_s=...`. A process that fails to exit remains
+owned and blocks replacement; it is not reported as successfully unloaded.
 
 The successful idle-unload log also reports fresh before/after memory readings:
 each monitored GPU's used MiB, system used RAM, and the encoder's RSS before exit

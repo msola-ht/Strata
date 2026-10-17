@@ -22,13 +22,13 @@ this top-level setting to the server configuration, alongside an API key:
 `vision.video.enabled` must also be true. Startup refuses file support without
 an API key or enabled video policy. The text model must be loaded before analysis.
 The SVF2 vision encoder must be loadable; it may already be resident, or start
-on demand through independent vision idle unloading or the elastic vision
-setting described below. File upload itself does not load the model. Disabling or
+on demand through the elastic vision lifecycle described below. File upload
+itself does not load the model. Disabling or
 omitting `video_files.enabled` leaves URL video preparation uncached. The existing
 single-video, user-message-only, no-image-mixing and no-engine-batching restrictions
 still apply. No generation or reasoning budget is added by this feature.
 
-With `idle_unload_s` enabled, an accepted video request prevents unloading from
+With elastic vision enabled, an accepted video request prevents unloading from
 preparation through generation and request-file cleanup, including the queue
 handoff between those stages. The idle interval starts again after cleanup,
 including failed or cancelled requests. A request that loses admission to an
@@ -46,23 +46,19 @@ the encoder changes its cache identity, so a still-valid file reference can be
 reused but requires preprocessing again. Existing cache entries remain subject
 to the usual TTL and capacity eviction.
 
-To release only the encoder after visual inactivity, add `"idle_unload_s": 600`
-inside the existing `vision` object (default `0`, disabled). This does not change
-the top-level model idle timer. With the text engine resident, plain text
-requests leave vision asleep. The next image or video request loads it again;
-an explicit `/v1/load` also preloads it. Engine batching is not supported with
-this option. Full model cold starts retain vision-first loading for VRAM sizing;
-this video endpoint still requires a loaded text model. Details and rollback:
-[independent vision idle unloading](DETAILS.md#sharing-the-gpu-with-other-programs-optional).
+To make the encoder elastic, add `"elastic": true` inside `vision` and choose
+`elastic_idle_s` (default 120). With top-level `"vram_elastic": true`, the first
+image or video request makes the expert cache keep `elastic_mib` free and starts
+the encoder; idle unload returns that VRAM to the cache. Without
+`vram_elastic`, the encoder still starts and stops on demand, but the expert
+cache cannot resize around it. The legacy `"idle_unload_s": 600` spelling inside
+`vision` maps to the same lifecycle and is deprecated.
 
-With `"elastic": true` inside `vision` and top-level `"vram_elastic": true`, the
-first image or video request makes the expert cache keep the configured
-`elastic_mib` free and starts the encoder. Video preparation and generation
-hold the same visual activity lease as the idle-unload path, so the encoder is
-not stopped between queue handoffs. `elastic_idle_s` starts again after image or
-video work ends, including failed or cancelled work. `/v1/load` does not start
-an elastic encoder; the next image or video does. `vision.idle_unload_s` and
-`vision.elastic` are mutually exclusive. Details:
+Video preparation, cache publication, generation and cleanup hold the same
+visual activity lease, so the encoder is not stopped between queue handoffs.
+`elastic_idle_s` starts again after image or video work ends, including failed
+or cancelled work. `/v1/load` does not start an elastic encoder; the next image
+or video does. Details:
 [the encoder on demand](VRAM_ELASTIC.md#the-image-encoder-on-demand).
 
 For video, FIFO waiting and encoder READY waiting use the same video request
@@ -411,13 +407,14 @@ concurrent admission boundary. The temporary server was closed. Native idle
 unloading, orphan-encoder reclamation, cancellation during preparation and the
 preparation-to-generation handoff remain unobserved on a real model.
 
-For independent vision sleep, manual loopback HTTP observations used the existing
-mock text engine and a lazy `Vision` instance with a real `strata-vision` binary.
+For the elastic vision lifecycle, manual loopback HTTP observations used the
+existing mock text engine and a lazy `Vision` instance with a real `strata-vision`
+binary.
 No usable vision weights were supplied: missing model paths deliberately exercised
 startup failure rather than visual inference. Responses and Chat text requests
 returned 200 with the scripted text, and Messages returned 200 with scripted
 content; the encoder process remained absent. `/v1/status` reported
-`vision.loaded: false` and the configured 0.4-second idle interval.
+`vision.loaded: false` and the configured 0.4-second `elastic_idle_s`.
 
 A video request attempted native encoder startup and returned 503
 `video_load_failed` for the missing model. Afterwards its process handle was

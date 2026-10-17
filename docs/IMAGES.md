@@ -79,7 +79,8 @@ If the optional vision encoder is resident, it counts as another user of the GPU
 encoder's `elastic_mib` while an elastic encoder remains loaded. The `unload`
 policy stops both processes and clears the vision-held share; an elastic encoder
 then starts again with the next image or video request. `vision.idle_unload_s`
-and `vision.elastic` cannot be enabled together.
+is a compatibility alias for the same elastic lifecycle, not a second unload
+implementation.
 
 ## Speed
 

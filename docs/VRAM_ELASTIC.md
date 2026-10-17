@@ -107,8 +107,10 @@ expert outside the cache), but I have not run a fault-injection test of these tw
 
 ## The image encoder on demand
 
-With `"elastic": true` in the config's `"vision"` section (and `"vram_elastic": true`; without it the server says so
-and starts the encoder with the model, as before) the GPU encoder is not started with the server or with a load:
+With `"elastic": true` in the config's `"vision"` section, the GPU encoder is not started with the server or with a
+load. The legacy `"idle_unload_s"` key in the same section maps to this lifecycle and to `elastic_idle_s`. With
+top-level `"vram_elastic": true`, the expert cache also coordinates its VRAM; without it the encoder still starts and
+stops on demand, but the cache cannot give or reclaim that room:
 
 - **An image or video turn** (the same FIFO turn an encode always takes): if the encoder is not running, the engine's
   `VRAM` command first keeps `"elastic_mib"` (default 2048) free on top of the reserve - the last `POST /v1/vram`, or 0
