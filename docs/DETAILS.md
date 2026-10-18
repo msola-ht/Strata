@@ -518,7 +518,7 @@ Windows, `build-essential` + CUDA on Ubuntu) and compiles the engine for your GP
 4. **Images?** yes / no (see [Images](#images-vision)).
 
 Then it downloads and prepares everything (the model is 66-76 GB, so the first start takes a while; an interrupted
-download continues where it stopped) and **starts the model**. Setup prints the local address and a generated API key;
+download continues where it stopped) and **starts the model**. Setup prints the local address;
 open `http://127.0.0.1:8080` for the Strata app. It has three tabs:
 - **Chat:** streaming answers, the model's thinking (folded away once it answers), code with a copy button, pictures when
   images are on, and sampling and thinking-level settings. Chats stay in your browser.
@@ -677,6 +677,11 @@ Images remain protected until their cached embeddings have been copied into a
 request-owned file. Videos remain protected through generation and cleanup.
 File uploads and lookups do not count as visual activity.
 
+The video budget also covers VRAM control replies. Cancelling an unanswered VRAM command ends the text engine
+so its late reply cannot reach a later request; the usual load path restarts it. Process cleanup can add up to
+five seconds. Rollback uses the remaining video budget; if it cannot grow the cache back, `POST /v1/vram` can
+retry. A vision process that has not exited retains its reserved share.
+
 `POST /load` and `POST /v1/load` load the text engine, but do not start an
 elastic vision encoder; the next image or video does. A non-elastic encoder
 still keeps the original vision-first cold-start ordering. Video requests
@@ -829,8 +834,7 @@ whether the file tier is busy. The cure for the slowness itself is memory: a sma
 
 ## Using it
 
-The server listens on `0.0.0.0:8080` by default and is reachable as `http://127.0.0.1:8080` on this PC (change the
-address with `--host`, the port with `--port`, or edit the run script).
+The server listens on `http://127.0.0.1:8080` (change with `--port` in setup, or edit the run script).
 
 | API | Endpoint |
 | --- | --- |
@@ -1020,8 +1024,7 @@ print(r.choices[0].message.content)
   `--prefill auto` (8192 tokens), a 42,131 token prompt read in 15 s sent six of them. A prompt shorter than one chunk
   sends nothing, and that is on purpose: its only line arrives once the prompt is read, because the last tokens go
   through the verify windows rather than the batched path, so it stops up to `--short-read` tokens short of the end.
-- **Chat apps.** Any app with an "OpenAI-compatible" provider works: base URL `http://127.0.0.1:8080/v1`, using the
-  API key saved in `strata-<model>.json` (or printed by setup).
+- **Chat apps.** Any app with an "OpenAI-compatible" provider works: base URL `http://127.0.0.1:8080/v1`, any API key.
   Zed's llama.cpp provider reads `/props` and offers tools from `chat_template_caps`. Its generic OpenAI-compatible
   provider does not: add `"capabilities": {"tools": true, "chat_completions": true}` on that model in Zed's settings.
 - **OpenCode** (#543). A starting point for `opencode.jsonc` (in your project, or `~/.config/opencode/`); the field
@@ -1034,7 +1037,7 @@ print(r.choices[0].message.content)
       "strata": {
         "npm": "@ai-sdk/openai-compatible",
         "name": "Strata (local)",
-        "options": { "baseURL": "http://127.0.0.1:8080/v1", "apiKey": "your api_key" },
+        "options": { "baseURL": "http://127.0.0.1:8080/v1", "apiKey": "none" },  // or your api_key
         "models": {
           "strata": {
             "name": "Qwen3.8-Flash-Next (Strata)",
@@ -1059,8 +1062,8 @@ print(r.choices[0].message.content)
   **Context** below), or add `"fit_max_tokens": true` to `strata-<model>.json`. For a hard cap on the thinking, add
   `"reasoning_budget_tokens": N` to `strata-<model>.json` (see above).
 - **Claude Code** (Strata 0.1.17 or newer): set `ANTHROPIC_BASE_URL=http://127.0.0.1:8080` and
-  `ANTHROPIC_MODEL` to a Claude model name it knows (it refuses names it doesn't; Strata ignores the name), plus your
-  configured `api_key` as `ANTHROPIC_AUTH_TOKEN`.
+  `ANTHROPIC_MODEL` to a Claude model name it knows (it refuses names it doesn't; Strata ignores the name), plus any
+  `ANTHROPIC_AUTH_TOKEN` (or your `api_key`, if you set one).
 - **Codex CLI** (0.1.39): see [the Responses API](#the-responses-api-and-codex-cli) below.
 - **Context.** Chosen in setup (8K-262K). Requests longer than that are refused, never silently cut. A request whose
   `max_tokens` would run past the context is refused too (400); agents that always ask for their full output cap
@@ -1077,9 +1080,9 @@ print(r.choices[0].message.content)
   `strata-<model>.json.bak`, and the model uses the change from its next start. Only Strata's own page can save
   (JSON, the API key when one is set, as for the Chat settings); the network, key, MCP and program keys are not
   editable there.
-- **From other devices on your network.** New installs listen on `0.0.0.0` and setup generates a private API key in
-  `strata-<model>.json`; start setup with `--host 127.0.0.1` to keep the server on this PC only. The server window
-  prints this PC's addresses
+- **From other devices on your network.** The server listens on your PC only (`127.0.0.1`) unless you say otherwise:
+  run setup with `START-HERE.bat --setup --host 0.0.0.0 --api-key some-long-secret` (or add `"host": "0.0.0.0"` and
+  `"api_key": "..."` to `strata-<model>.json`). The server window then prints this PC's addresses
   (`from other devices: http://192.168.x.x:8080/`); open that on the other device, or use `.../v1` as an API base URL.
   On Windows the firewall blocks it until you allow it: accept its prompt for Python (private networks), or run
   `New-NetFirewallRule -DisplayName "Strata 8080" -Direction Inbound -Protocol TCP -LocalPort 8080 -Action Allow -Profile Private`
