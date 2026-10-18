@@ -62,7 +62,7 @@ or cancelled work. `/v1/load` does not start an elastic encoder; the next image
 or video does. Details:
 [the encoder on demand](VRAM_ELASTIC.md#the-image-encoder-on-demand).
 
-For video, FIFO waiting and encoder READY waiting use the same video request
+For video, FIFO waiting, engine-control waiting, VRAM resizing and encoder READY waiting use the same video request
 deadline and cancellation event as preprocessing. Encoder startup is also bounded
 by its existing READY timeout. Streaming requests keep their existing heartbeats.
 A cancelled startup kills and reaps the process it started before releasing the
@@ -71,6 +71,14 @@ retain their own budgets and can start a fresh encoder. If a process cannot be
 reaped, its handle remains owned and replacement is refused. Successful startup
 refreshes encoder identity before a cache key is selected. No request context or
 answer is stored by the wake path.
+
+If a video is cancelled or its budget expires after a VRAM command was sent but before its reply arrives, the
+server ends that text-engine process. This prevents a late VRAM reply from being consumed by another command.
+The process is given up to five seconds to exit; its handle remains owned if it is still stopping. The next text
+request or explicit load uses the usual engine restart path; video itself does not reload the text model.
+If resizing already finished and cancellation prevents the encoder from starting, rollback only uses the
+remaining video budget. The expert cache can remain smaller if no budget remains; `POST /v1/vram` can reclaim it.
+An encoder that has not exited keeps its reserved share until it can be reaped.
 
 The store creates a private `strata-video-*` directory under the OS temporary
 directory, or under the existing parent supplied in `video_files.directory`.

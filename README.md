@@ -105,9 +105,8 @@ asks you a few questions:
 - whether it should read pictures.
 
 Press Enter each time for the recommended answer. Then it downloads the model (about 70 GB) and starts it. If the
-download stops, run it again: it continues where it left off. Setup prints the Strata address and an automatically
-generated API key; open `http://127.0.0.1:8080` yourself. The server is reachable from other devices on the local
-network by default. Use `--host 127.0.0.1` to keep it on this PC only.
+download stops, run it again: it continues where it left off. Setup prints the Strata address; open
+`http://127.0.0.1:8080` yourself.
 
 > **While the model starts, your PC can be slow or stop responding for 1-3 minutes** (longest the first time).
 > Strata loads 35-55 GB into your RAM and locks part of it for the graphics card. This is normal. Wait, and don't
@@ -157,8 +156,7 @@ Sizes, downloads and what fits where: [docs/MODELS.md](docs/MODELS.md). To add a
 - **In the browser:** open `http://127.0.0.1:8080`. It has **Chat**, a live **Monitor** of the model and your
   GPU/CPU/RAM, and **About** with the settings and addresses.
 - **Your apps and coding agents:** add an "OpenAI-compatible" provider with the base URL
-  **`http://127.0.0.1:8080/v1`**. Use the API key printed by setup (also saved as `"api_key"` in
-  `strata-<model>.json`); any model name works.
+  **`http://127.0.0.1:8080/v1`**. Any API key and any model name work.
   - Apps that use Anthropic's API: `http://127.0.0.1:8080/v1/messages` (Claude Code:
     `ANTHROPIC_BASE_URL=http://127.0.0.1:8080`).
   - Codex CLI and other apps that use the OpenAI Responses API: `/v1/responses`
@@ -167,9 +165,7 @@ Sizes, downloads and what fits where: [docs/MODELS.md](docs/MODELS.md). To add a
   fastest. High is best for hard questions.
 - **Pictures:** say yes to "Images?" in setup. Then click **Picture** in the chat, or attach pictures in your app.
   AMD cards read pictures on Linux through the processor; on Windows they can't yet.
-- **From your phone or another PC:** new installs already use `--host 0.0.0.0` with a generated key. The server
-  window prints the LAN address; open that address on the other device. You can rotate `"api_key"` in the model
-  config at any time.
+- **From your phone or another PC:** `START-HERE.bat --setup --host 0.0.0.0 --api-key <secret>`. Always set a key.
 - **One request at a time:** by default Strata answers one request, and the others wait. To answer several at once,
   set `"parallel": 2` ([BATCHING.md](docs/BATCHING.md)). On a 12 GB card this makes each answer slower.
 - **Long prompts:** Strata reads the first message of a chat in full, about 1 minute per 30,000 tokens. Follow-up

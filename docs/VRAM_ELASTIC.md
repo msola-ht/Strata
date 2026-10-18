@@ -128,7 +128,12 @@ Video Responses requests use the same wake path. Their activity lease covers
 preparation, cache publication, generation and cleanup, so an elastic encoder
 cannot be stopped between those stages. Image generation's `shrink` policy
 restores the base reserve plus a still-held `elastic_mib`; its `unload` policy
-stops both the text engine and the encoder and clears that held share.
+stops both the text engine and the encoder and clears that held share, but is
+refused as busy while an image or video request still holds a visual activity lease.
+Video wake-up includes the VRAM exchange in its preparation budget. If that
+exchange is cancelled before its reply arrives, the text engine is ended to
+prevent a stale control reply; the next load restarts it. If cancellation leaves
+a completed shrink without time to grow back, `POST /v1/vram` can reclaim the room.
 
 `--vram-elastic` turns `--kv-grow` off (the engine says so at start): with both asked, the whole K/V is in VRAM.
 

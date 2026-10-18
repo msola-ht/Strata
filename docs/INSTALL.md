@@ -35,7 +35,7 @@ the engine for your GPU (asks first; 20-40 minutes once). More: [details](DETAIL
 3. Answer a few questions - or just press Enter each time for the recommended choice ([the questions](#setups-questions)).
 
 Then it downloads everything (the model is ~70 GB, so the first time takes a while - you can stop and it picks up
-where it left off) and **starts the model**. Setup prints the local address and a generated API key but does not open
+where it left off) and **starts the model**. Setup prints the local address but does not open
 a browser; open `http://127.0.0.1:8080` yourself.
 
 > **While the model starts, your PC can be slow or stop responding for 1-3 minutes** (longest the first time): Strata
@@ -200,7 +200,9 @@ says so and starts the engine you had.
   rewrites the keys setup writes (`exe`, `args`, `port`, `gpu`, `host`, `api_key`, `vision`, ...) and keeps the
   ones you added (`sampling`, `mcp_servers`, `mcp`, `cors_origins`, ...); the earlier file is kept as
   `strata-<model>.json.bak` (0.1.39). Engine options you added to `"args"` by hand are not carried over: setup names
-  them, and you add them again.
+  them, and you add them again. This fork keeps the model's existing `open_browser` choice unless you override it.
+  New installs leave the browser closed, including Qwen3.6 installs;
+  `--browser` / `--no-browser` save your choice for later starts.
 - **The model files** (`models/`, `packs/`, `mtp/`, 70-120 GB): in **`Strata-data` next to the Strata folder**, or
   wherever `--data-dir` put them.
 - **Where that data folder is:** `%APPDATA%\Strata\settings.json` on Windows, `~/.config/strata/settings.json` on
@@ -252,7 +254,7 @@ START-HERE.bat --vram-reserve-mib 2048          leave 2 GB of VRAM free for othe
 START-HERE.bat --no-browser                     do not open the chat page when the model is ready (remembered;
                                                 --browser undoes it)
 START-HERE.bat --setup --backend hip            the AMD engine on a PC that also has an NVIDIA card
-START-HERE.bat --setup --host 127.0.0.1                      keep the server on this PC only
+START-HERE.bat --setup --host 0.0.0.0 --api-key <secret>     reachable from other devices, with a key
 START-HERE.bat --calibrate                      tune the engine for this PC (about 15-30 minutes, longer on a slow card), then start
 START-HERE.bat --check                          only check this PC
 ```

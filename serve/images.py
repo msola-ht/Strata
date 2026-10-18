@@ -190,6 +190,8 @@ class ImageGen:
         self.totals = {"images": 0, "jobs": 0, "seconds": 0.0, "failed": 0}
         self.last = None                           # the last job's figures (/v1/status)
         self.progress = None                       # (step, steps) of the running job
+        self._pending = None                       # (process, work directory) until a killed job actually exits
+        self._pending_restore = None               # (policy, restore) retained by gpu_turn while it still runs
 
     def missing(self) -> list[str]:
         return [self.cfg[k] for k in ("exe", "diffusion_model", "vae", "llm") if not Path(self.cfg[k]).exists()]
@@ -217,70 +219,123 @@ class ImageGen:
         p = self.dir / name
         return p if p.is_file() else None
 
-    def run(self, job: dict, cancel: threading.Event | None = None) -> tuple[list[bytes], dict]:
-        """Run sd-cli for `job` (parse_request's dict) -> (the PNG files' bytes in order, figures).  The caller holds
-        the GPU turn.  ImageJobFailed when sd-cli fails, times out or is cancelled."""
-        work = Path(tempfile.mkdtemp(prefix="job-", dir=self.dir))
-        pattern = str(work / "img_%d.png")
-        cmd = sd_cli_args(self.cfg, job, pattern)
-        timeout = float(self.cfg.get("timeout_s") or 3600)
-        logf = work / "sd-cli.log"
-        t0 = time.monotonic()
-        self.progress = (0, job["steps"])
-        with self.lock:
-            with open(logf, "w", encoding="utf-8", errors="replace") as lf:
-                try:
-                    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                            stdin=subprocess.DEVNULL, env=image_env(self.cfg),
-                                            cwd=str(work), text=True, errors="replace", bufsize=1)
-                except OSError as e:
-                    raise ImageJobFailed(f"sd-cli did not start ({cmd[0]}): {e}") from e
-                try:
-                    from serve.winjob import contain
-                    contain(proc)                 # ends with the server (Windows)
-                except Exception:
-                    pass
-                why = None
+    @property
+    def cleanup_pending(self) -> bool:
+        return self._pending is not None
 
-                def pump():
-                    for line in proc.stdout:
-                        lf.write(line)
-                        m = STEP_LINE.search(line)
-                        if m:
-                            self.progress = (int(m.group(1)), int(m.group(2)))
-                reader = threading.Thread(target=pump, daemon=True)
-                reader.start()
-                while proc.poll() is None:
-                    if cancel is not None and cancel.is_set():
-                        why = "cancelled (the client left)"
-                    elif time.monotonic() - t0 > timeout:
-                        why = f"it ran past timeout_s ({timeout:g} s)"
-                    if why:
-                        proc.kill()
-                        break
-                    time.sleep(0.2)
-                with contextlib.suppress(subprocess.TimeoutExpired):
-                    proc.wait(timeout=30)
-                reader.join(timeout=10)
-        secs = time.monotonic() - t0
-        self.progress = None
-        log = logf.read_text(encoding="utf-8", errors="replace")
-        outs = [work / f"img_{i}.png" for i in range(job["n"])]
-        try:
-            if why or proc.returncode != 0 or not all(p.is_file() for p in outs):
-                self.totals["failed"] += 1
-                tail = "\n".join(log.strip().splitlines()[-12:])
-                what = why or (f"sd-cli exited with code {proc.returncode}" if proc.returncode
-                               else "sd-cli wrote no image")
-                self._say(f"image job failed: {what}\n{tail}")
-                raise ImageJobFailed(f"{what}; the end of its log:\n{tail}")
-            images = [p.read_bytes() for p in outs]
-        finally:
+    @staticmethod
+    def _clean_work(work: Path) -> None:
+        with contextlib.suppress(OSError):
             for p in work.iterdir():
                 with contextlib.suppress(OSError):
                     p.unlink()
-            with contextlib.suppress(OSError):
-                work.rmdir()
+            work.rmdir()
+
+    def _stop_job(self, proc, work: Path) -> None:
+        if proc.poll() is not None:
+            return
+        with contextlib.suppress(OSError):
+            proc.kill()
+        try:
+            proc.wait(timeout=5)
+        except (subprocess.TimeoutExpired, OSError) as e:
+            self._pending = (proc, work)
+            raise ImageJobFailed("sd-cli is still stopping; the GPU remains unavailable until it exits") from e
+
+    def finish_pending(self, svc) -> bool:
+        """With exclusive engine control, reap an exited job and restore its GPU policy; never wait for its exit."""
+        if not self.lock.acquire(blocking=False):
+            return False
+        try:
+            if self._pending is None:
+                return True
+            proc, work = self._pending
+            if proc.poll() is None:
+                return False
+            self._clean_work(work)
+            restore = self._pending_restore
+            self._pending = self._pending_restore = None
+        finally:
+            self.lock.release()
+        # Eager reload can enter the service's loading path again, so clear pending state before giving VRAM back.
+        if restore is not None:
+            _give_back(svc, self, *restore)
+        return True
+
+    def run(self, job: dict, cancel: threading.Event | None = None) -> tuple[list[bytes], dict]:
+        """Run sd-cli for `job` (parse_request's dict) -> (the PNG files' bytes in order, figures).  The caller holds
+        the GPU turn.  ImageJobFailed when sd-cli fails, times out or is cancelled."""
+        try:
+            return self._run_job(job, cancel)
+        except (ImageJobFailed, OSError, ValueError) as e:
+            self.totals["failed"] += 1
+            self._say(f"image job failed: {e}")
+            if isinstance(e, ImageJobFailed):
+                raise
+            raise ImageJobFailed(f"image job could not finish: {e}") from e
+
+    def _run_job(self, job: dict, cancel: threading.Event | None) -> tuple[list[bytes], dict]:
+        with self.lock:
+            work = None
+            proc = None
+            t0 = time.monotonic()
+            self.progress = (0, job["steps"])
+            try:
+                if self.cleanup_pending:
+                    raise ImageJobFailed("the previous sd-cli job is still stopping; the GPU is unavailable")
+                if cancel is not None and cancel.is_set():
+                    raise ImageJobFailed("cancelled (the client left)")
+                work = Path(tempfile.mkdtemp(prefix="job-", dir=self.dir))
+                cmd = sd_cli_args(self.cfg, job, str(work / "img_%d.png"))
+                timeout = float(self.cfg.get("timeout_s") or 3600)
+                logf = work / "sd-cli.log"
+                why = None
+                # The child writes its log directly.  Polling a separate file handle avoids a reader thread that
+                # could outlive the job or stop draining a pipe after a disk error.
+                with logf.open("w", encoding="utf-8", errors="replace") as lf:
+                    try:
+                        proc = subprocess.Popen(cmd, stdout=lf, stderr=subprocess.STDOUT,
+                                                stdin=subprocess.DEVNULL, env=image_env(self.cfg), cwd=str(work))
+                    except OSError as e:
+                        raise ImageJobFailed(f"sd-cli did not start ({cmd[0]}): {e}") from e
+                    try:
+                        from serve.winjob import contain
+                        contain(proc)                 # ends with the server (Windows)
+                    except Exception:
+                        pass
+                    with logf.open("r", encoding="utf-8", errors="replace") as progress_log:
+                        pending = ""
+                        while proc.poll() is None:
+                            if cancel is not None and cancel.is_set():
+                                why = "cancelled (the client left)"
+                            elif time.monotonic() - t0 > timeout:
+                                why = f"it ran past timeout_s ({timeout:g} s)"
+                            if why:
+                                break
+                            pending += progress_log.read()
+                            for m in STEP_LINE.finditer(pending):
+                                self.progress = (int(m.group(1)), int(m.group(2)))
+                            pending = re.split(r"[\r\n]", pending)[-1]
+                            time.sleep(0.2)
+                    # A killed process may take time to exit.  Keep its ownership and GPU reservation if it does.
+                    self._stop_job(proc, work)
+                secs = time.monotonic() - t0
+                log = logf.read_text(encoding="utf-8", errors="replace")
+                outs = [work / f"img_{i}.png" for i in range(job["n"])]
+                if why or proc.returncode != 0 or not all(p.is_file() for p in outs):
+                    tail = "\n".join(log.strip().splitlines()[-12:])
+                    what = why or (f"sd-cli exited with code {proc.returncode}" if proc.returncode
+                                   else "sd-cli wrote no image")
+                    raise ImageJobFailed(f"{what}; the end of its log:\n{tail}")
+                images = [p.read_bytes() for p in outs]
+            finally:
+                try:
+                    if proc is not None and not self.cleanup_pending:
+                        self._stop_job(proc, work)
+                finally:
+                    self.progress = None
+                    if work is not None and not self.cleanup_pending:
+                        self._clean_work(work)
         figures = {"seconds": round(secs, 2), "steps": job["steps"], "n": job["n"],
                    "size": f"{job['width']}x{job['height']}", "seed": job["seed"],
                    "backend": self.cfg.get("backend"), "quant": self.cfg.get("quant")}
@@ -320,6 +375,8 @@ class ImageGen:
                "quant": self.cfg.get("quant"), "gpu_policy": self.policy, **self.totals}
         if self.progress:
             out["step"], out["steps"] = self.progress
+        if self.cleanup_pending:
+            out["cleanup_pending"] = True
         if self.last:
             out["last"] = self.last
         return out
@@ -356,12 +413,6 @@ def engine_elastic(eng) -> bool:
     return "--vram-elastic" in (args or [])
 
 
-def _client_gone(svc) -> Exception:
-    """The server module's ClientGone (it may run as __main__, so not imported by name)."""
-    import sys
-    return getattr(sys.modules.get(type(svc).__module__), "ClientGone", RuntimeError)()
-
-
 @contextlib.contextmanager
 def gpu_turn(svc, gen: ImageGen, job: dict, cancel: threading.Event | None = None):
     """The image job's turn on the GPU: the service's FIFO (and, with parallel requests, the engine's control lines
@@ -374,34 +425,28 @@ def gpu_turn(svc, gen: ImageGen, job: dict, cancel: threading.Event | None = Non
             with svc.status_lock:
                 svc.status["queued"] -= 1
             queued = False
-            ctl = getattr(svc.engine, "ctl", None) if getattr(svc.engine, "batch", 0) else None
-            if ctl is not None:
-                while not ctl.acquire(timeout=0.25):
-                    if cancel is not None and cancel.is_set():
-                        raise _client_gone(svc)
-            try:
-                if ctl is not None:                   # running parallel requests finish first
-                    while getattr(svc, "live_reqs", None):
-                        if cancel is not None and cancel.is_set():
-                            raise _client_gone(svc)
-                        time.sleep(0.25)
+            with svc._engine_control(cancel):
                 need = need_mib(gen.cfg, job["width"], job["height"])
                 policy = resolve_policy(svc, gen, need)
-                with svc.status_lock:
-                    svc.status.update(busy=True, phase="generating an image", started=time.time(),
-                                      first_token=None, prompt_tokens=None, generated=None, max_tokens=None)
-                restore = None
-                try:
-                    restore = _make_room(svc, gen, policy, need)
-                    yield policy
-                finally:
-                    _give_back(svc, gen, policy, restore)
+                activity = svc._visual_unload() if policy == "unload" else contextlib.nullcontext()
+                with activity:
                     with svc.status_lock:
-                        svc.status["busy"] = False
-                    svc.last_request_at = time.time()
-            finally:
-                if ctl is not None:
-                    ctl.release()
+                        svc.status.update(busy=True, phase="generating an image", started=time.time(),
+                                          first_token=None, prompt_tokens=None, generated=None, max_tokens=None)
+                    restore = None
+                    try:
+                        restore = _make_room(svc, gen, policy, need)
+                        yield policy
+                    finally:
+                        try:
+                            if gen.cleanup_pending:
+                                gen._pending_restore = (policy, restore)
+                            else:
+                                _give_back(svc, gen, policy, restore)
+                        finally:
+                            with svc.status_lock:
+                                svc.status["busy"] = False
+                            svc.last_request_at = time.time()
     finally:
         if queued:
             with svc.status_lock:
@@ -436,10 +481,10 @@ def _make_room(svc, gen: ImageGen, policy: str, need: int):
                 gen._say(f"image job: the conversation could not be saved ({e}); unloading the model")
                 with contextlib.suppress(OSError):
                     os.unlink(path)
+        if saved:
+            svc.restore_after_load = saved            # either model's stop can fail after the conversation was saved
         eng.unload()
         svc.vision_held = False                      # the engine has no expert cache left to reserve for the encoder
-        if saved:
-            svc.restore_after_load = saved            # a failed encoder stop must not lose the saved conversation
         if svc.vision is not None and hasattr(svc.vision, "unload"):
             svc.vision.unload()
         return saved or "unloaded"

@@ -59,10 +59,19 @@ The answer is OpenAI's shape (`created`, `data[].b64_json` or `data[].url`, `rev
 stable-diffusion.cpp: 8 steps, CFG 1, euler, Turbo's own sigmas, `--diffusion-fa`. An image from the API is the PNG
 plain `sd-cli` writes with the same arguments, byte for byte.
 
+If `sd-cli` cannot start, exits without the requested images, or its log or output cannot be read, the endpoint
+returns `image_generation_failed` and increments the `failed` count in `/v1/status`'s `image_generation` object.
+The request's progress is cleared when it ends; its temporary files are removed after its process exits.
+A disconnected client or `images.timeout_s` cancels the process before the GPU is returned to the text engine.
+If the process has not exited five seconds after it is killed, the request fails with `cleanup_pending: true`
+in the image status. Its files and GPU reservation remain held. Later requests retry cleanup without waiting
+for that process; GPU work stays unavailable until it exits, when the deferred text-engine policy is restored.
+
 ## Sharing the GPU with the text model
 
 One job at a time: an image job takes the same turn a chat request takes, so a chat request waits for the image and
-the other way round. What the text model does meanwhile is the config's `images.gpu_policy`:
+the other way round. With batching, the service first blocks new request admissions and lets existing requests
+finish, then takes the engine's control lines. What the text model does meanwhile is the config's `images.gpu_policy`:
 
 | policy | the text model during an image job |
 |---|---|
@@ -81,6 +90,11 @@ policy stops both processes and clears the vision-held share; an elastic encoder
 then starts again with the next image or video request. `vision.idle_unload_s`
 is a compatibility alias for the same elastic lifecycle, not a second unload
 implementation.
+
+If an image or video request is still preparing or using the models, an image-generation job that would unload
+them is refused as busy. Retry after that request finishes. It does not hold the GPU turn while waiting for a
+visual request that needs the same turn. New visual requests cannot acquire a lease during the unload job;
+depending on the entry point, they wait for loading or receive a busy/unavailable response.
 
 ## Speed
 
