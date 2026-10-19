@@ -15,7 +15,7 @@ name: sync-upstream
 
 on:
   schedule:
-    - cron: "7,22,37,52 * * * *"           # every 15 minutes; GitHub may delay or drop scheduled runs
+    - cron: "7 * * * *"                    # every hour; GitHub may delay or drop scheduled runs
   workflow_dispatch:                      # or by hand: Actions -> sync-upstream -> Run workflow
     inputs:
       branches:
