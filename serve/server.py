@@ -2580,6 +2580,7 @@ class Vision:
         self._directory_lock = threading.RLock()
         self._shutdown = False
         self.video_capable = False
+        self.video_pair_limit = False
         self.video_probed = False
         self.spawn = (args, log, env)                   # to start it again after an unload
         self._identity_paths = [args[0], args[2], args[4]]
@@ -2667,7 +2668,7 @@ class Vision:
             self.proc = popen("the image encoder", args, role="vision", stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                               stderr=log or subprocess.DEVNULL, text=True, encoding="utf-8", bufsize=1, env=env,
                               cwd=self.dir)
-        self.video_capable, self.video_probed = False, False
+        self.video_capable, self.video_probed, self.video_pair_limit = False, False, False
         try:
             line = self._readline(VISION_READY_S, "the vision encoder did not start", budget)
             if not line.startswith("READY"):
@@ -2690,6 +2691,7 @@ class Vision:
         self.stopped = False
 
         self.video_capable = "video=SVF2" in line.split()
+        self.video_pair_limit = "video_pair_tokens=1" in line.split()
         self.video_probed = True
         self.video_identity = self._video_identity(self._identity_paths, self.spawn[0])
 
@@ -2734,7 +2736,8 @@ class Vision:
             try:
                 packet_name = Path(packet).relative_to(self.dir).as_posix()
                 output_name = Path(output).relative_to(self.dir).as_posix()
-                proc.stdin.write(f"ENCV2 {budget.settings['max_tokens']} {packet_name} {output_name}\n")
+                pair_limit = f"pair_tokens={budget.settings['pair_tokens']} " if self.video_pair_limit else ""
+                proc.stdin.write(f"ENCV2 {budget.settings['max_tokens']} {pair_limit}{packet_name} {output_name}\n")
                 proc.stdin.flush()
                 reader.start()
                 result = []
@@ -2768,7 +2771,7 @@ class Vision:
                         raise video_api.VideoError("invalid video layout")
                     seconds, cells = float(stamp[1:]), int(image[1:])
                     if not math.isfinite(seconds) or not 0 <= seconds <= budget.settings["max_duration_s"] \
-                            or (layout and seconds <= layout[-1][0]) or not 0 < cells <= 1024:
+                            or (layout and seconds <= layout[-1][0]) or not 0 < cells <= budget.settings["pair_tokens"]:
                         raise video_api.VideoError("invalid video timestamp or cell count")
                     layout.append((seconds, cells))
                 if sum(cells for _, cells in layout) != count:
@@ -2881,7 +2884,7 @@ class Vision:
             self._close_proc_pipes(self.proc)
         self.proc = None
         self.stopped = True
-        self.video_capable, self.video_probed = False, False
+        self.video_capable, self.video_probed, self.video_pair_limit = False, False, False
         self._start(budget)
 
     @staticmethod
@@ -4129,7 +4132,9 @@ class Service:
                 raise
             if self.vision_held and hasattr(self.engine, "vram") and self.loaded():
                 try:
-                    self.engine.vram(self._engine_reserve(), **vram_kwargs)
+                    # The request may already be cancelled. Compensation owns a separate, bounded exchange;
+                    # reusing its budget would refuse the restore before any VRAM command is sent.
+                    self.engine.vram(self._engine_reserve(), timeout=5.0)
                 except Exception as e:              # noqa: BLE001 - keep the start error as the request's cause
                     print(f"[strata] vision: the expert cache did not grow back after the encoder failed to start "
                           f"({e}); POST /v1/vram can retry", flush=True)
@@ -4418,26 +4423,30 @@ class Service:
         if not self.fifo.acquire(blocking=False):
             return "busy"
         try:
-            with self.status_lock:
-                if (self.status.get("busy") or self.status.get("queued") or self._video_requests
-                        or self._vision_requests or self._image_cleanup_pending()):
-                    return "busy"
-                if idle_for is not None and time.time() - (self.last_request_at or self.started_at) < idle_for:
-                    return "busy"
-                # Publish the decision before releasing status_lock: a video
-                # request must not accept live processes already being closed.
-                self._unloading = True
-            if not self.engine.alive() and (self.vision is None or
-                    (not self.vision.alive() and getattr(self.vision, "proc", None) is None)):
-                self.vision_held = False
-                return "not loaded"
-            self.engine.unload()
-            self.vision_held = False
-            if self.vision is not None and hasattr(self.vision, "unload"):
-                self.vision.unload()
-            print(f"[strata] model unloaded{f' after {idle_for:.0f} s idle' if idle_for else ''}; "
-                  "the next request loads it again", flush=True)
-            return "unloaded"
+            try:
+                # Batch requests do not hold the FIFO. Close their admission gate before deciding the model
+                # is idle, and keep it closed until STOP/QUIT and the vision unload have both finished.
+                with self._engine_control(wait=False):
+                    with self.status_lock:
+                        if (self.status.get("busy") or self.status.get("queued") or self._video_requests
+                                or self._vision_requests or self._image_cleanup_pending()):
+                            return "busy"
+                        if idle_for is not None and time.time() - (self.last_request_at or self.started_at) < idle_for:
+                            return "busy"
+                        self._unloading = True
+                    if not self.engine.alive() and (self.vision is None or
+                            (not self.vision.alive() and getattr(self.vision, "proc", None) is None)):
+                        self.vision_held = False
+                        return "not loaded"
+                    self.engine.unload()
+                    self.vision_held = False
+                    if self.vision is not None and hasattr(self.vision, "unload"):
+                        self.vision.unload()
+                    print(f"[strata] model unloaded{f' after {idle_for:.0f} s idle' if idle_for else ''}; "
+                          "the next request loads it again", flush=True)
+                    return "unloaded"
+            except ModelBusy:
+                return "busy"
         finally:
             with self.status_lock:
                 self._unloading = False

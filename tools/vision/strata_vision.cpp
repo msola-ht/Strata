@@ -8,9 +8,9 @@
 //                 [--max-tokens N] [--min-tokens N] [--flash-attn on|off|auto]
 // Flash attention defaults to auto, and to off on the CPU when ggml is built with AVX-512 (see main).
 //
-// Resident: prints "READY <n_embd> video=SVF2", then per stdin line
+// Resident: prints "READY <n_embd> video=SVF2 video_pair_tokens=1", then per stdin line
 //   ENC <image path> <output path>   ->  "OK <n_tokens> <nx> <ny> <ms>"  or  "ERR <message>"
-//   ENCV2 <max_total_tokens> <packet path> <output path>
+//   ENCV2 <max_total_tokens> [pair_tokens=<limit>] <packet path> <output path>
 //                                  ->  "OK <n_tokens> <n_pairs> <n_frames> <ms>" then "LAYOUT <layout>"
 //   QUIT
 // The output file is  int32 {0x31455653 'SVE1', n_tokens, nx, ny, n_embd}  then float32 [n_tokens][n_embd],
@@ -89,6 +89,7 @@ constexpr uint64_t kVideoOutputBytes = uint64_t(kVideoMaxTokens) * kVideoEmbeddi
 
 struct Encv2Args {
     int max_total_tokens = 0;
+    int max_pair_tokens = kVideoMaxFrameTokens;
     std::string packet, out;
 };
 
@@ -102,7 +103,18 @@ bool parse_encv2(const std::string& line, Encv2Args& a) {
     std::getline(is, rest);
     const size_t first = rest.find_first_not_of(" \t");
     if (first == std::string::npos) return false;
-    return parse_enc("ENC " + rest.substr(first), a.packet, a.out);
+    rest = rest.substr(first);
+    if (rest.rfind("pair_tokens=", 0) == 0) {
+        const size_t end = rest.find_first_of(" \t");
+        if (end == std::string::npos) return false;
+        std::istringstream limit(rest.substr(12, end - 12));
+        if (!(limit >> a.max_pair_tokens) || limit.peek() != std::char_traits<char>::eof() ||
+            a.max_pair_tokens <= 0 || a.max_pair_tokens > kVideoMaxFrameTokens) return false;
+        const size_t path = rest.find_first_not_of(" \t", end);
+        if (path == std::string::npos) return false;
+        rest = rest.substr(path);
+    }
+    return parse_enc("ENC " + rest, a.packet, a.out);
 }
 
 using FilePtr = std::unique_ptr<FILE, int (*)(FILE*)>;
@@ -151,9 +163,9 @@ bool read_timestamp(FILE* f, double& value) {
 // A pair must map exactly onto the engine's existing 2-D SVE1 positions. Inspect every row before encoding or
 // writing, rather than accepting a rectangular last position while earlier rows use temporal or other positions.
 std::string write_video_record(mtmd_context* ctx, const mtmd_input_chunk* ch, int n_embd, FILE* f,
-                               int row_room, uint64_t byte_room, int& n) {
+                               int row_room, int pair_limit, uint64_t byte_room, int& n) {
     const size_t rows = mtmd_input_chunk_get_n_tokens(ch);
-    if (rows == 0 || rows > size_t(kVideoMaxFrameTokens) || rows > size_t(row_room))
+    if (rows == 0 || rows > size_t(pair_limit) || rows > size_t(row_room))
         return "the video exceeds its image token budget";
     const mtmd_image_tokens* it = mtmd_input_chunk_get_tokens_image(ch);
     if (!it) return "the video has no image tokens";
@@ -204,7 +216,9 @@ std::string encode_video_packet(mtmd_context* ctx, int n_embd, const Encv2Args& 
     const uint64_t expected_bytes = sizeof header + uint64_t(frames) * (8 + rgb_bytes);
     if (expected_bytes != uint64_t(file_bytes)) return "the SVF2 video packet length does not match its header";
     const int expected_pairs = int((frames + 1) / 2);
-    const uint64_t predicted_rows = uint64_t(expected_pairs) * (uint64_t(width) * height / 1024);
+    const uint64_t pair_rows = uint64_t(width) * height / 1024;
+    if (pair_rows > uint64_t(a.max_pair_tokens)) return "the video exceeds its per-pair image token budget";
+    const uint64_t predicted_rows = uint64_t(expected_pairs) * pair_rows;
     if (predicted_rows > uint64_t(a.max_total_tokens)) return "the video exceeds its image token budget";
     std::vector<double> timestamps(frames);
     for (uint32_t i = 0; i < frames; ++i) {
@@ -262,7 +276,7 @@ std::string encode_video_packet(mtmd_context* ctx, int n_embd, const Encv2Args& 
             if (mtmd_input_chunk_get_type(ch) == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
                 int n = 0;
                 const std::string err = write_video_record(ctx, ch, n_embd, output.file,
-                                                           a.max_total_tokens - total,
+                                                           a.max_total_tokens - total, a.max_pair_tokens,
                                                            kVideoOutputBytes - output_bytes, n);
                 if (!err.empty()) return err;
                 if (!layout.empty()) layout += ';';
@@ -516,7 +530,7 @@ int main(int argc, char** argv) {
         mtmd_input_chunks_free(chunks);
         if (bm) mtmd_bitmap_free(bm);
     }
-    std::printf("READY %d%s\n", n_embd, video_profile ? " video=SVF2" : "");
+    std::printf("READY %d%s\n", n_embd, video_profile ? " video=SVF2 video_pair_tokens=1" : "");
     std::fflush(stdout);
 
     std::string line;

@@ -46,7 +46,7 @@ def validate_artifact(path, layout, settings):
     with Path(path).open("rb") as source:
         for seconds, cells in layout:
             if not math.isfinite(seconds) or not previous < seconds <= settings["max_duration_s"] \
-                    or not isinstance(cells, int) or not 0 < cells <= 1024:
+                    or not isinstance(cells, int) or not 0 < cells <= settings["pair_tokens"]:
                 raise VideoError("invalid cached video timestamp or cells")
             header = source.read(20)
             if len(header) != 20:
