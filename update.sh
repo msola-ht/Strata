@@ -2,7 +2,8 @@
 # Update Strata without starting the model (#475): the newest code (git pull, when this folder is a git clone), then
 # what ./setup.sh does before a start - the engine (a new ready-made one when this version needs it, or compiled
 # again when its source changed), the Python packages, each installed model's settings and draft subset. The model
-# files are not touched. Start the model later with ./setup.sh. Options are passed on to setup.py.
+# files are not touched. Start the model later with ./setup.sh. Options are passed on to setup.py. The bundled Python
+# (python/ beside this file) is used when there is one: ./setup.sh, which this file runs, picks it.
 cd "$(dirname "$0")" || exit 1
 # all of it in a function, read before it runs: the git pull below can change this very file
 main() {
@@ -10,16 +11,6 @@ main() {
     if ! command -v git >/dev/null 2>&1; then
       echo "This folder is a git clone, but git is not installed: install it (sudo apt install git) or run"
       echo "\"git pull\" here yourself, then run ./update.sh again."
-      exit 1
-    fi
-    # This fork's own changes live on the dev branch (main is the upstream mirror): another branch would update
-    # upstream's code instead, so say so instead of touching it (STRATA_UPDATE_ANY_BRANCH=1 skips the check).
-    branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
-    if [ -z "${STRATA_UPDATE_ANY_BRANCH:-}" ] && [ "$branch" != "dev" ] \
-            && git show-ref --verify --quiet refs/remotes/origin/dev; then
-      echo "This is the video fork: its own changes live on the dev branch, and this clone is on $branch."
-      echo "Nothing was updated. Switch first (git switch dev), then run ./update.sh again."
-      echo "Or skip this check with STRATA_UPDATE_ANY_BRANCH=1 ./update.sh"
       exit 1
     fi
     echo "Getting the newest Strata (git pull) ..."
@@ -63,7 +54,7 @@ main() {
     fi
   else
     echo "This copy of Strata was not made with git, so it cannot fetch new files itself. Download the newest one:"
-    echo "  https://github.com/msola-ht/Strata/archive/refs/heads/dev.zip"
+    echo "  https://github.com/Niko1221/Strata/archive/refs/heads/main.zip"
     echo "unzip it anywhere and run ./setup.sh (or ./update.sh) in it: it finds the model files in Strata-data and"
     echo "sets itself up the same way - nothing big is downloaded again."
     echo "Checking this copy's engine and settings meanwhile ..."

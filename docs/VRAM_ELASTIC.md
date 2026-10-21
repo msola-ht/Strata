@@ -107,33 +107,20 @@ expert outside the cache), but I have not run a fault-injection test of these tw
 
 ## The image encoder on demand
 
-With `"elastic": true` in the config's `"vision"` section, the GPU encoder is not started with the server or with a
-load. The legacy `"idle_unload_s"` key in the same section maps to this lifecycle and to `elastic_idle_s`. With
-top-level `"vram_elastic": true`, the expert cache also coordinates its VRAM; without it the encoder still starts and
-stops on demand, but the cache cannot give or reclaim that room:
+With `"elastic": true` in the config's `"vision"` section (and `"vram_elastic": true`; without it the server says so
+and starts the encoder with the model, as before) the GPU encoder is not started with the server or with a load:
 
-- **An image or video turn** (the same FIFO turn an encode always takes): if the encoder is not running, the engine's
+- **A picture's turn** (the same FIFO turn an encode always takes): if the encoder is not running, the engine's
   `VRAM` command first keeps `"elastic_mib"` (default 2048) free on top of the reserve - the last `POST /v1/vram`, or 0
   when none was made - and then the encoder starts. If the cache cannot shrink (the resident low-RAM mode, an engine
   without `--vram-elastic`) it starts anyway, as a non-elastic encoder would, and the log says why.
-- **Idle** for `"elastic_idle_s"` (default 120) without visual work: a thread stops the encoder between requests and
+- **Idle** for `"elastic_idle_s"` (default 120) without a picture: a thread stops the encoder between requests and
   sends `VRAM` with that reserve again, so the cache grows back to the size it had (0, not the start's reserve: that
   would leave it a segment or more smaller).
 - **`POST /v1/vram` while the encoder runs** keeps the asked reserve on top of the encoder's share; the encoder's stop
   then goes back to the asked reserve.
-- An unload of the model stops the encoder too. The log lines start with `[strata] vision:` **(code; the unit tests in
+- An unload of the model stops the encoder too. The log lines start with `[strata] images:` **(code; the unit tests in
   `serve/test_vision_elastic.py` pin each case)**.
-
-Video Responses requests use the same wake path. Their activity lease covers
-preparation, cache publication, generation and cleanup, so an elastic encoder
-cannot be stopped between those stages. Image generation's `shrink` policy
-restores the base reserve plus a still-held `elastic_mib`; its `unload` policy
-stops both the text engine and the encoder and clears that held share, but is
-refused as busy while an image or video request still holds a visual activity lease.
-Video wake-up includes the VRAM exchange in its preparation budget. If that
-exchange is cancelled before its reply arrives, the text engine is ended to
-prevent a stale control reply; the next load restarts it. If cancellation leaves
-a completed shrink without time to grow back, `POST /v1/vram` can reclaim the room.
 
 `--vram-elastic` turns `--kv-grow` off (the engine says so at start): with both asked, the whole K/V is in VRAM.
 

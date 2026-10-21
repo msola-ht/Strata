@@ -208,9 +208,11 @@ def prepare(source, directory, budget, *, local_file=None):
     log = directory / "worker.log"
     # The worker never prints URLs or credentials. It creates at most one codec at a time.
     with log.open("wb") as stderr:
-        proc = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), str(request)],
-                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=stderr,
-                                start_new_session=os.name == "posix")
+        from serve import lifeline
+        proc = lifeline.popen([sys.executable, str(Path(__file__).resolve()), str(request)], "video",
+                              stdin=subprocess.PIPE if os.name == "nt" else subprocess.DEVNULL,
+                              stdout=subprocess.DEVNULL, stderr=stderr,
+                              start_new_session=os.name == "posix")
         observed = []
 
         def progress():
@@ -239,6 +241,21 @@ def prepare(source, directory, budget, *, local_file=None):
                     budget.trace.event(name, event="start")
 
         try:
+            if os.name == "nt":
+                # Attach to the server's Job before the worker creates its nested per-request Job. Otherwise a
+                # fast worker can establish its own hierarchy first and make the server's assignment fail.
+                import ctypes
+                from ctypes import wintypes
+                from serve import winjob
+                contained = wintypes.BOOL()
+                check = winjob._k32.IsProcessInJob
+                check.argtypes = (wintypes.HANDLE, wintypes.HANDLE, ctypes.POINTER(wintypes.BOOL))
+                if not winjob._job or not check(int(proc._handle), winjob._job, ctypes.byref(contained)) \
+                        or not contained.value:
+                    raise VideoError("video worker could not establish Windows parent containment")
+                budget.check()
+                proc.stdin.write(b"\x01")
+                proc.stdin.close()
             while proc.poll() is None:
                 progress()
                 budget.check()
@@ -260,6 +277,9 @@ def prepare(source, directory, budget, *, local_file=None):
                                    elapsed_s=f"{time.monotonic()-observed[-1][1]:.3f}")
             raise VideoStageError(stage, str(e)) from None
         finally:
+            if proc.stdin is not None:
+                with contextlib.suppress(OSError, ValueError):
+                    proc.stdin.close()
             stop(proc)
             request.unlink(missing_ok=True)
             budget.current_stage = "preparation"
@@ -268,7 +288,12 @@ def prepare(source, directory, budget, *, local_file=None):
 
 def _command(args, output, limit):
     """Bound both pipes while draining; never let codec diagnostics fill disk/RAM."""
-    proc = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    from serve import lifeline
+    # PDEATHSIG is not inherited through fork: every codec needs its own lifeline to the worker. On macOS its
+    # watcher owns a separate pipe to the worker; on Windows it also inherits the worker's per-request Job.
+    # Keep the worker's POSIX process group so request cancellation still ends the entire decode immediately.
+    proc = lifeline.popen(args, "video-codec", stdin=subprocess.DEVNULL,
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     errors = []
 
     def drain(stream, sink, maximum):
@@ -438,8 +463,12 @@ def _worker(request):
 
 
 if __name__ == "__main__":
+    # This file is also executed by path, where Python otherwise searches serve/ rather than the package root.
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     request = Path(sys.argv[1])
     try:
+        if os.name == "nt" and sys.stdin.buffer.read(1) != b"\x01":
+            raise VideoError("video worker parent ended before startup")
         if os.name == "posix":
             import resource
             resource.setrlimit(resource.RLIMIT_AS, (2 << 30, 2 << 30))
@@ -447,7 +476,6 @@ if __name__ == "__main__":
         elif os.name == "nt":
             # A separate job per worker: killing one request must not kill other
             # model processes, and killing the worker must kill its codec too.
-            sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
             from serve import winjob
             import ctypes
             job = winjob._make_job()
