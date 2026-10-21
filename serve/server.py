@@ -3543,7 +3543,16 @@ def vision_env(cfg: dict, env: dict) -> dict:
     """The image encoder's environment: the engine's, unless the config's vision section names its own "cuda_device"
     (numbered like nvidia-smi) - then the encoder runs on that card alone, so a spare GPU can hold it while the engine
     keeps all of its own cards' VRAM (#408, Efs-O).  Without it, nothing changes."""
-    dev = (cfg.get("vision") or {}).get("cuda_device")
+    vision = cfg.get("vision") or {}
+    if "lib_dirs" in vision:
+        env = dict(env)
+        var = "PATH" if os.name == "nt" else "LD_LIBRARY_PATH"
+        # An engine-only upgrade can keep a custom video reader on its original runtime.
+        engine_dirs = set(cfg.get("lib_dirs") or [])
+        inherited = [p for p in env.get(var, "").split(os.pathsep) if p and p not in engine_dirs]
+        dirs = [str(p) for p in vision.get("lib_dirs") or [] if Path(p).is_dir()]
+        env[var] = os.pathsep.join(dirs + inherited)
+    dev = vision.get("cuda_device")
     if dev is None:
         return env
     env = dict(env)

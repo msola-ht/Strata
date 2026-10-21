@@ -6334,6 +6334,115 @@ def upgrade_config(cfg_path: Path, cfg: dict) -> dict:
     return cfg
 
 
+def update_component_engines(have: list) -> bool:
+    """Update legacy prebuilt installs from the signed feed, without replacing their picture readers.
+
+    Each config keeps an absolute engine path: the legacy launcher does not resolve component references.
+    Versioned packages and the old engine stay on disk, including after a partial config-write failure.
+    """
+    from strata_control import engine_component as ec, feed, signing, updater
+    from strata_cli import version
+    from strata_cli.update_cmd import DEFAULT_FEED
+
+    groups = {}
+    for path in have:
+        cfg = json.loads(path.read_text(encoding="utf-8-sig"))
+        exe = Path(cfg["exe"])
+        try:
+            meta = json.loads((exe.parent / "BUILD.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        packaged = (exe.parent / ec.MANIFEST).is_file()
+        legacy = exe.resolve() in {(engine_dir(t) / EXE).resolve() for t in (12, 13)}
+        if not packaged and (not legacy or meta.get("source") == "local"):
+            continue                            # custom/local engines keep their existing update path
+        backend = cfg.get("backend") or meta.get("backend") or "cuda"
+        if backend not in ("cuda", "hip"):
+            continue
+        toolkit = config_toolkit(cfg)
+        groups.setdefault((backend, toolkit), []).append((path, cfg))
+    if not groups:
+        return True
+    root = ROOT / ".engine-updates"
+    try:
+        with updater.update_lock(root):
+            state = updater.State(root)
+            trusted = signing.load_trusted_keys()
+            if signing.extra_keys_in_effect():
+                warn("the update also trusts keys from STRATA_UPDATE_TRUSTED_KEYS")
+            for (backend, toolkit), configs in groups.items():
+                hardware = updater.detect_hardware({**os.environ, ec.ENV_BACKEND: backend})
+                hardware["runtime"] = version()
+                if backend == "cuda":
+                    cards = gpus()
+                    selected = set()
+                    for _, cfg in configs:
+                        choice = cfg.get("gpu")
+                        selected.update(choice if isinstance(choice, list) else [choice] if isinstance(choice, int) else [])
+                    if selected and all(isinstance(c.get("gpu"), (int, list)) for _, c in configs):
+                        cards = [g for g in cards if g["index"] in selected]
+                        if {g["index"] for g in cards} != selected:
+                            raise RuntimeError("a GPU selected by an installed model could not be detected")
+                    hardware["cuda_archs"] = ["sm_" + str(g["arch"]) for g in cards]
+                    if not hardware["cuda_archs"] or not hardware.get("nvidia_driver"):
+                        raise RuntimeError("cannot identify the NVIDIA GPU and driver; keeping the installed engine")
+                ctx = updater.Context(components=root, source=DEFAULT_FEED, trusted=trusted, hardware=hardware,
+                                      emit=lambda e: say("  " + e["message"]) if e.get("message") else None)
+                loaded = updater.open_feed(ctx, state)
+                state.save()
+                candidates = [p for p in loaded.engine if p.backend == backend and
+                              (backend != "cuda" or p.variant == f"cuda{toolkit}")]
+                package, reasons = feed.select_engine(candidates, hardware)
+                if package is None:
+                    raise RuntimeError("no compatible engine in the update feed: " + "; ".join(reasons))
+                pending = [(p, c) for p, c in configs if engine_version(Path(c["exe"])) < feed.version_key(package.version)]
+                if not pending:
+                    ok(f"installed {backend} engine is current ({package.version} or newer)")
+                    continue
+                updater.wait_until_idle(ctx.serving, wait=0, emit=ctx.emit)
+                final = root / "engine" / (updater.folder_name(package) + "-" + package.manifest_sha256[:12])
+                stage = None
+                try:
+                    if not final.exists():
+                        updater._free_space_check(root, package.size + package.installed_bytes, ctx,
+                                                  package.sha256, "engine")
+                        archive = updater._download(ctx, "engine", package.url, package.size, package.sha256,
+                                                    f"engine {package.label}", loaded)
+                        stage, component = updater.stage_engine(ctx, loaded, package, archive)
+                        final.parent.mkdir(parents=True, exist_ok=True)
+                        component.root.replace(final)
+                        archive.unlink(missing_ok=True)
+                    component = ec.read_manifest(final)
+                    if updater._manifest_sha(final) != package.manifest_sha256:
+                        raise RuntimeError("installed component manifest differs from the signed feed")
+                    ec.verify(component, full=True)
+                    updater.binary_smoke(component)
+                    updater.wait_until_idle(ctx.serving, wait=0, emit=ctx.emit)
+                    for path, cfg in pending:
+                        # Do not overwrite settings saved while the download was in progress.
+                        current = json.loads(path.read_text(encoding="utf-8-sig"))
+                        if current != cfg:
+                            raise RuntimeError(f"{path.name} changed during the update; run UPDATE again (earlier configs may already be updated)")
+                        new = dict(cfg)
+                        new["exe"] = str(component.exe)
+                        new["lib_dirs"] = list(dict.fromkeys(ec.package_lib_dirs(final) + (cfg.get("lib_dirs") or [])))
+                        if backend == "cuda":
+                            new["cuda"] = toolkit
+                        if cfg.get("vision"):
+                            new["vision"] = dict(cfg["vision"])
+                            new["vision"].setdefault("lib_dirs", cfg.get("lib_dirs") or [])
+                        shutil.copy2(path, path.with_name(path.name + ".before-engine-update"))
+                        write_config(path, new)
+                        ok(f"{path.name}: engine {package.version}; previous config kept as .before-engine-update")
+                finally:
+                    if stage is not None:
+                        shutil.rmtree(stage, ignore_errors=True)
+    except (OSError, ValueError, RuntimeError) as e:
+        warn(f"engine update incomplete: {e}. Existing engines and model files were kept; retry UPDATE after fixing this.")
+        return False
+    return True
+
+
 def update_install(have: list, a) -> int:
     """#475: `setup.py --update` (UPDATE.bat / update.sh, after their git pull): what a plain START-HERE.bat does to
     an install before it starts the model, without starting it - the Python packages, the ready-made engine when this
@@ -6349,6 +6458,8 @@ def update_install(have: list, a) -> int:
                 "numpy, jinja2, regex, pyyaml, tqdm, requests, pillow, psutil")
     if not a.build:
         update_installed_engine(a.prebuilt)
+        if a.prebuilt == PREBUILT_URL and not update_component_engines(have):
+            return 1
     mtp_done: set = set()
     for cfg_path in have:
         cfg = upgrade_config(cfg_path, json.loads(cfg_path.read_text(encoding="utf-8-sig")))
