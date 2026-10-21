@@ -294,15 +294,11 @@ class ImageGen:
                 # could outlive the job or stop draining a pipe after a disk error.
                 with logf.open("w", encoding="utf-8", errors="replace") as lf:
                     try:
-                        proc = subprocess.Popen(cmd, stdout=lf, stderr=subprocess.STDOUT,
-                                                stdin=subprocess.DEVNULL, env=image_env(self.cfg), cwd=str(work))
+                        from serve import lifeline
+                        proc = lifeline.popen(cmd, "image", stdout=lf, stderr=subprocess.STDOUT,
+                                              stdin=subprocess.DEVNULL, env=image_env(self.cfg), cwd=str(work))
                     except OSError as e:
                         raise ImageJobFailed(f"sd-cli did not start ({cmd[0]}): {e}") from e
-                    try:
-                        from serve.winjob import contain
-                        contain(proc)                 # ends with the server (Windows)
-                    except Exception:
-                        pass
                     with logf.open("r", encoding="utf-8", errors="replace") as progress_log:
                         pending = ""
                         while proc.poll() is None:
