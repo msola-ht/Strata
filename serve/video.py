@@ -161,6 +161,12 @@ class Trace:
             details = " ".join(f"{key}={value}" for key, value in fields.items())
             print(f"[strata] video trace={self.id} stage={stage} {details}", flush=True)
 
+    def data(self, stage, payload):
+        """One bounded JSON object, so a log reader never has to parse Python repr."""
+        if self.enabled:
+            details = json.dumps(payload, separators=(",", ":"), allow_nan=False)
+            print(f"[strata] video trace={self.id} stage={stage} data={details}", flush=True)
+
     @contextlib.contextmanager
     def stage(self, name, cancel=None, deadline=None, timeout_errors=()):
         started = time.monotonic()
@@ -264,6 +270,19 @@ def prepare(source, directory, budget, *, local_file=None):
                     budget.current_stage = name
                     budget.trace.event(name, event="start")
 
+        def trace_diagnostics():
+            path = directory / "diagnostics.json"
+            if not budget.trace.enabled or not path.is_file():
+                return
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(payload, dict):
+                    budget.trace.data("sampling", payload)
+            except (OSError, ValueError, TypeError):
+                budget.trace.event("sampling", diagnostics="unreadable")
+            finally:
+                path.unlink(missing_ok=True)
+
         try:
             if os.name == "nt":
                 # Attach to the server's Job before the worker creates its nested per-request Job. Otherwise a
@@ -306,6 +325,7 @@ def prepare(source, directory, budget, *, local_file=None):
                     proc.stdin.close()
             stop(proc)
             request.unlink(missing_ok=True)
+            trace_diagnostics()
             budget.current_stage = "preparation"
     return directory / "frames.svf"
 
@@ -527,12 +547,12 @@ def _scene_cuts(source_file, settings, common):
     except (VideoError, OSError):
         output.unlink(missing_ok=True)
         print("[strata] video scene=fallback", file=sys.stderr, flush=True)
-        return []
+        return [], True
     try:
         text = output.read_text(encoding="utf-8", errors="replace")
     except OSError:
         print("[strata] video scene=fallback", file=sys.stderr, flush=True)
-        return []
+        return [], True
     finally:
         output.unlink(missing_ok=True)
     cuts = {}
@@ -556,7 +576,7 @@ def _scene_cuts(source_file, settings, common):
                 cuts[key] = max(score, cuts.get(key, 0.0))
             current = None
     print(f"[strata] video scene=cuts count={len(cuts)}", file=sys.stderr, flush=True)
-    return sorted(cuts.items())
+    return sorted(cuts.items()), False
 
 
 def _worker(request):
@@ -662,8 +682,10 @@ def _worker(request):
     rows = w // 32 * (h // 32)
     size = w * h * 3
     cuts = []
+    scene_fallback = False
     if p.get("keyframes", "uniform") == "hybrid":
-        cuts = [(float(stamp) - float(origin), score) for stamp, score in _scene_cuts(source_file, p, common)]
+        raw_cuts, scene_fallback = _scene_cuts(source_file, p, common)
+        cuts = [(float(stamp) - float(origin), score) for stamp, score in raw_cuts]
         cuts = [(stamp, score) for stamp, score in cuts if 0 <= stamp <= float(times[-1])]
     key_indices = [i for i, frame in enumerate(frames) if frame.get("key_frame") == 1]
     pairs, effective = _select_pairs(times, p, rows, cuts, key_indices)
@@ -675,6 +697,30 @@ def _worker(request):
         raise VideoError("video exceeds visual token or RGB budget")
     print(f"[strata] video selected_pairs={len(pairs)} frames={len(indices)} "
           f"effective_fps={effective:.6g}", file=sys.stderr, flush=True)
+    if p.get("diagnostics"):
+        scene_times = [round(stamp, 6) for stamp, _score in cuts]
+        payload = {
+            "mode": p.get("keyframes", "uniform"),
+            "fit": p.get("fit", "fixed"),
+            "fps": float(p["fps"]),
+            "effective_fps": round(float(effective), 6),
+            "source_frames": len(times),
+            "pair_count": len(pairs),
+            "frame_count": len(indices),
+            "pairs": [[round(float(times[a]), 6), round(float(times[b]), 6)] for a, b in pairs],
+            "pair_midpoints": [round((float(times[a]) + float(times[b])) / 2, 6) for a, b in pairs],
+            "scene_fallback": scene_fallback,
+            "scene_cut_count": len(cuts),
+            "scene_cuts": scene_times[:256],
+            "scene_cuts_truncated": len(scene_times) > 256,
+            "keyframe_count": len(key_indices),
+            "rows_per_pair": rows,
+        }
+        try:
+            (directory / "diagnostics.json").write_text(
+                json.dumps(payload, separators=(",", ":"), allow_nan=False), encoding="utf-8")
+        except OSError:
+            print("[strata] video diagnostics could not be written", file=sys.stderr, flush=True)
     raw = directory / "frames.rgb"
     select = _select_expression(indices)
     _command([p["ffmpeg"], *common, "-xerror", "-noautorotate", "-threads", "1", "-i", str(source_file),

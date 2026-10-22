@@ -170,6 +170,33 @@ A long video may also need a larger `max_source_bytes` and `deadline_s`; the
 defaults are sized for short uploads, and a 1080p ten-minute file can exceed
 64 MiB before decoding.
 
+### Diagnostics
+
+With `"diagnostics": true`, the server log gets one structured sampling line:
+
+```text
+[strata] video trace=<id> stage=sampling data={"mode":"hybrid",...}
+```
+
+The `data` object has `mode`, `fit`, `fps`, `effective_fps`, `source_frames`,
+`pair_count`, `frame_count`, `pairs`, `pair_midpoints`, `scene_fallback`,
+`scene_cut_count`, `scene_cuts`, `scene_cuts_truncated`, `keyframe_count` and
+`rows_per_pair`. Pair times are seconds from the first source timestamp.
+`scene_cuts` is capped at 256 entries; the count and truncation flag describe
+the full result. Diagnostics never change the selected frames or the cache key.
+
+The Windows acceptance driver keeps the same object under
+`variants[].sampling` in `report.json`, and prints a short line in its summary:
+
+```text
+sampling/diagnostics: mode=hybrid fit=fixed fps=2.0 effective_fps=2.0 pairs=7 frames=14 cuts=2 fallback=False first=[0.0, 0.033333] last=[5.933333, 5.966667]
+```
+
+Use `variants[].sampling.pairs` for every selected frame pair and
+`variants[].sampling.scene_cuts` for the detected cut times. A cache hit does
+not run sampling again; its `sampling` value is the most recent sampling line
+from that variant's server log.
+
 ## Failure handling
 
 - A scene pass that fails for a reason other than cancellation or timeout

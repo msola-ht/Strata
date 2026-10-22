@@ -473,13 +473,38 @@ def latest_trace(log: Path, pattern: str) -> re.Match | None:
     return matches[-1] if matches else None
 
 
+def sampling_diagnostics(log: Path) -> dict | None:
+    text = log.read_text(encoding="utf-8", errors="replace")
+    marker = "stage=sampling data="
+    for line in reversed(text.splitlines()):
+        if "[strata] video trace=" not in line or marker not in line:
+            continue
+        try:
+            value = json.loads(line.split(marker, 1)[1].strip())
+        except (ValueError, TypeError):
+            continue
+        return value if isinstance(value, dict) else None
+    return None
+
+
+def sampling_summary(sampling: dict) -> str:
+    pairs = sampling.get("pairs") or []
+    first = pairs[0] if pairs else None
+    last = pairs[-1] if pairs else None
+    return (f"mode={sampling.get('mode')} fit={sampling.get('fit')} "
+            f"fps={sampling.get('fps')} effective_fps={sampling.get('effective_fps')} "
+            f"pairs={sampling.get('pair_count')} frames={sampling.get('frame_count')} "
+            f"cuts={sampling.get('scene_cut_count')} fallback={sampling.get('scene_fallback')} "
+            f"first={first} last={last}")
+
+
 def check(name: str, ok: bool, detail: str) -> dict:
     return {"name": name, "ok": bool(ok), "detail": detail, "at": now_iso()}
 
 
 def run_variant(variant: str, base_cfg: dict, args: argparse.Namespace,
                 work: Path, videos: dict, vision_exe: Path, vision_gpu: bool, ffmpeg: Path,
-                ffprobe: Path, api_key: str) -> dict:
+                ffprobe: Path, api_key: str, expected_scene_cuts: int | None) -> dict:
     say()
     say(f"=== {variant} ===")
     port = free_port()
@@ -488,6 +513,7 @@ def run_variant(variant: str, base_cfg: dict, args: argparse.Namespace,
                               ffprobe=ffprobe, api_key=api_key, port=port)
     log = work / f"{variant}-server.log"
     checks: list[dict] = []
+    sampling = None
     proc = handle = None
     started = time.monotonic()
     vision_cfg = base_cfg.get("vision") or {}
@@ -509,7 +535,8 @@ def run_variant(variant: str, base_cfg: dict, args: argparse.Namespace,
             checks.append(check("request", False, "upload returned no file_id"))
             return {"variant": variant, "vision_elastic": elastic, "config": str(config),
                     "config_sha256": hashlib.sha256(config.read_bytes()).hexdigest(), "log": str(log),
-                    "checks": checks, "elapsed_s": round(time.monotonic() - started, 2)}
+                    "sampling": None, "checks": checks,
+                    "elapsed_s": round(time.monotonic() - started, 2)}
 
         question = ("List the main colors in the order they appear." if variant in ("uniform", "hybrid")
                     else "Describe the main motion and the final scene.")
@@ -523,6 +550,20 @@ def run_variant(variant: str, base_cfg: dict, args: argparse.Namespace,
             ok = status == 200 and bool(answer.strip())
             checks.append(check("request", ok, f"HTTP {status}; answer={answer[:1000]!r}; "
                                                f"usage={json.dumps(response.get('usage') or {}, ensure_ascii=False)}"))
+            sampling = sampling_diagnostics(log)
+            expected = VARIANTS[variant]
+            diagnostics_ok = bool(
+                sampling
+                and sampling.get("mode") == expected["keyframes"]
+                and sampling.get("fit") == expected["fit"]
+                and isinstance(sampling.get("effective_fps"), (int, float))
+                and isinstance(sampling.get("pair_count"), int)
+                and sampling["pair_count"] > 0
+                and len(sampling.get("pairs") or []) == sampling["pair_count"]
+            )
+            checks.append(check(
+                "sampling/diagnostics", diagnostics_ok,
+                sampling_summary(sampling) if sampling else "no sampling diagnostics"))
             if status == 200:
                 health_status, after = http_json(f"{base}/health", timeout=10)
                 checks.append(check("health/video-ready", health_status == 200 and after.get("videos") is True,
@@ -532,6 +573,14 @@ def run_variant(variant: str, base_cfg: dict, args: argparse.Namespace,
                 visual = int(trace.group(1)) if trace else -1
                 checks.append(check("budget/visual-tokens", 0 < visual <= 32768,
                                     f"visual_tokens={visual}"))
+                if sampling:
+                    checks.append(check(
+                        "budget/effective-fps",
+                        float(sampling.get("effective_fps") or 0) < float(sampling.get("fps") or 0)
+                        and int(sampling.get("frame_count") or 0) <= int(VARIANTS["budget"]["max_frames"]),
+                        f"effective_fps={sampling.get('effective_fps')} "
+                        f"fps={sampling.get('fps')} frames={sampling.get('frame_count')} "
+                        f"pairs={sampling.get('pair_count')}"))
             if variant == "uniform" and status == 200:
                 checks.append(check("cache/first-miss", "video cache=miss" in log.read_text(
                     encoding="utf-8", errors="replace"), "first request used a cache miss"))
@@ -543,7 +592,16 @@ def run_variant(variant: str, base_cfg: dict, args: argparse.Namespace,
                                     f"HTTP {status2}; answer={answer2[:500]!r}"))
             if variant == "hybrid" and status == 200 and bool(answer.strip()):
                 checks.append(check("hybrid/no-crash", True,
-                                    "the request completed; current worker logs do not expose selected cut timestamps"))
+                                    "the request completed; sampling diagnostics are checked separately"))
+                if sampling:
+                    expected = int(expected_scene_cuts) if expected_scene_cuts is not None else None
+                    checks.append(check(
+                        "hybrid/scene-cuts",
+                        (sampling.get("scene_fallback") is True if expected is None else
+                         sampling.get("scene_fallback") is False
+                         and int(sampling.get("scene_cut_count") or 0) >= expected),
+                        f"scene_cuts={sampling.get('scene_cut_count')} "
+                        f"expected={expected} fallback={sampling.get('scene_fallback')}"))
     except SetupError as error:
         checks.append(check("variant/setup", False, str(error)))
     except Exception as error:  # noqa: BLE001 - report the failed manual check and continue
@@ -556,6 +614,7 @@ def run_variant(variant: str, base_cfg: dict, args: argparse.Namespace,
         "config": str(config),
         "config_sha256": hashlib.sha256(config.read_bytes()).hexdigest(),
         "log": str(log),
+        "sampling": sampling_diagnostics(log),
         "checks": checks,
         "elapsed_s": round(time.monotonic() - started, 2),
     }
@@ -650,7 +709,18 @@ def main(argv: list[str] | None = None) -> int:
         for variant in selected:
             report["variants"].append(run_variant(
                 variant, base_cfg, args, work, videos, vision_exe, vision_gpu,
-                ffmpeg, ffprobe, api_key))
+                ffmpeg, ffprobe, api_key, probe.get("cuts")))
+        by_variant = {item["variant"]: item for item in report["variants"]}
+        uniform_sampling = (by_variant.get("uniform") or {}).get("sampling")
+        hybrid_sampling = (by_variant.get("hybrid") or {}).get("sampling")
+        if uniform_sampling and hybrid_sampling:
+            uniform_pairs = {tuple(pair) for pair in uniform_sampling.get("pairs") or []}
+            hybrid_pairs = {tuple(pair) for pair in hybrid_sampling.get("pairs") or []}
+            by_variant["hybrid"]["checks"].append(check(
+                "hybrid/replaced-pairs",
+                hybrid_pairs != uniform_pairs,
+                f"uniform={len(uniform_pairs)} hybrid={len(hybrid_pairs)} "
+                f"shared={len(uniform_pairs & hybrid_pairs)}"))
         report["finished_at"] = now_iso()
         all_checks = [item for variant in report["variants"] for item in variant["checks"]]
         failed = [item for item in all_checks if not item["ok"]]
