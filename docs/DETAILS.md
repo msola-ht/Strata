@@ -829,7 +829,7 @@ The server listens on `http://127.0.0.1:8080` (change with `--port` in setup, or
 | --- | --- |
 | OpenAI Chat Completions (stream and non-stream, tools) | `POST /v1/chat/completions` |
 | Anthropic Messages (stream and non-stream, tools) | `POST /v1/messages` |
-| OpenAI Responses (stream and non-stream, tools; stateless, [below](#the-responses-api-and-codex-cli)) | `POST /v1/responses` |
+| OpenAI Responses (stream and non-stream, tools and images; opt-in video, [below](#the-responses-api-and-codex-cli); stateless) | `POST /v1/responses` |
 | Model list / health | `GET /v1/models`, `GET /models`, `GET /health` |
 | Model properties | `GET /props` (also accepts `?model=<loaded-model-id>`) |
 | What the model is doing right now | `GET /status`, `GET /slots` (busy or idle, with `n_prompt_tokens`; one entry per slot with `--batch`) |
@@ -1452,7 +1452,7 @@ more than 16 MiB apart. A symbolic link, a second hard link and a file with one 
 
 **Current limits (v1):** one request at a time unless `"parallel": N` is set (opt-in batch slots, up to N requests
 decoded together: [BATCHING.md](BATCHING.md)), and one conversation cached at a time (switching between two chats
-re-reads the other one unless the opt-in cache above is enabled, or each conversation keeps its own batch slot); images only when set up with them (below); no video. **Temperature / top_p / top_k / min_p /
+re-reads the other one unless the opt-in cache above is enabled, or each conversation keeps its own batch slot); images only when set up with them (below), and one video per Responses request when [video input](#video-input-opt-in) is enabled. **Temperature / top_p / top_k / min_p /
 seed** are honored per request (OpenAI and Anthropic fields), and so are stop strings (OpenAI `stop`, a string or up
 to 4; Anthropic `stop_sequences`): the answer ends before the first one, which is not sent, and the engine stops
 there (`finish_reason` "stop"; `stop_reason` "stop_sequence" with `stop_sequence` set to the one found); with the default adaptive expert tier a sampled result
@@ -1733,6 +1733,18 @@ after `"elastic_idle_s"` (default 120) without a picture it stops and the cache 
 took 1,339 MiB and started in 4.7 s (2.7 s the next time); a request with one picture took 8.6 s with the start and
 5.0 s on a later cold start, and 2 / 5 / 10 pictures with the encoder running took 3.8 / 5.6 / 9.0 s (~0.45 s to encode
 each, the same as on a second card). Without the key nothing changes.
+
+### Video input (opt-in)
+
+Video input is available on `POST /v1/responses` only. Send one video in a `user` message, without image parts. The
+source can be an `http(s)` URL, a base64 `data:video/...` URL, or a `file_id` returned by the authenticated video
+upload endpoint. Offline mode accepts the data URL and uploaded file, but refuses a URL that would need a download.
+
+Set `"video": {"enabled": true}` in the model config's `"vision"` section, and make sure `ffmpeg` and `ffprobe` are on
+`PATH` (or name them with `vision.video.ffmpeg` and `vision.video.ffprobe`). The encoder must be built with the SVF2
+video profile. On Windows, `BUILD-VIDEO.ps1` builds it; point `vision.exe` in the model config at the resulting
+`strata-vision.exe`. Engine batching must be off. The limits and defaults are listed in `serve/video.py`; malformed,
+rotated, oversized or overlong videos are refused before encoding.
 
 ### Sending a picture
 
