@@ -5239,6 +5239,8 @@ class Service:
             budget = getattr(self.embeddings, "video_budget", None)
             if budget is None:
                 raise ValueError("video input is supported through POST /v1/responses only")
+            if self.offline and isinstance(videos[0], str) and videos[0].startswith(("http://", "https://")):
+                raise ValueError("offline mode cannot download a video URL; upload the video or send a data: video URL")
             return self._prepare_video(messages, tools, kwargs, max_new, force, req, budget)
         fetched = self._note_unreadable_tool_images(messages, cancel)
         ids = encoded_ids = self.encode_prompt(messages, tools, kwargs)
@@ -7977,6 +7979,9 @@ def make_handler(svc: Service):
                 source = videos_of(messages)[0]
                 file_id = source["file_id"] if isinstance(source, dict) else None
                 self.video_file_request = file_id is not None
+                if svc.offline and isinstance(source, str) and source.startswith(("http://", "https://")):
+                    raise ResponsesError("offline mode cannot download a video URL; upload the video or send a "
+                                         "data: video URL", "input", "video_offline")
                 if file_id is not None:
                     if any(m.get("role") != "user" and videos_of([m]) for m in messages):
                         raise ResponsesError("video input is supported in user messages only", "input")
