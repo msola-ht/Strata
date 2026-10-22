@@ -1746,6 +1746,13 @@ video profile. On Windows, `BUILD-VIDEO.ps1` builds it; point `vision.exe` in th
 `strata-vision.exe`. Engine batching must be off. The limits and defaults are listed in `serve/video.py`; malformed,
 rotated, oversized or overlong videos are refused before encoding.
 
+The default `"keyframes": "uniform"` keeps the 2 fps nearest-frame grid. `"keyframes": "hybrid"` keeps that coverage
+and replaces some pairs with scene cuts and I-frames; the vision encoder always receives two-frame pairs, because
+Qwen3.8-Flash-Next uses a temporal patch of two. `"fit": "budget"` lowers the effective FPS when a long video would
+otherwise exceed `max_frames` or `max_tokens`, instead of refusing it. The model's context also caps the video token
+budget: the server lowers `max_tokens` to the room left in the request. The full chain, selection rules and failure
+handling are in [VIDEO_PIPELINE.md](VIDEO_PIPELINE.md).
+
 ### Sending a picture
 
 **Terminal chat:** type `/image <path to a picture>`, press Enter, then type your question.

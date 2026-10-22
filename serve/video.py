@@ -13,6 +13,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import shutil
 import signal
 import struct
@@ -72,6 +73,10 @@ CEILINGS = {"fps": 24, "max_duration_s": 600, "max_frames": 1024,
             "max_source_bytes": 256 << 20, "max_source_frames": 65536,
             "max_source_pixels": 16 << 20, "pair_tokens": 1024,
             "max_tokens": 65536, "deadline_s": 1800}
+# Optional keys are deliberately not merged into DEFAULTS: a config that does
+# not name them keeps the same settings dictionary, and therefore the same
+# video cache key, as before this change.
+OPTIONAL = {"keyframes", "fit", "scene_threshold", "scene_share", "scene_min_gap_s"}
 
 
 def policy(config):
@@ -81,7 +86,7 @@ def policy(config):
         raise VideoError("vision.video must be an object with enabled: true or false")
     if not config.get("enabled", False):
         return None
-    if set(config) - set(DEFAULTS) - {"enabled", "diagnostics"}:
+    if set(config) - set(DEFAULTS) - OPTIONAL - {"enabled", "diagnostics"}:
         raise VideoError("unknown vision.video setting")
     if not isinstance(config.get("diagnostics", False), bool):
         raise VideoError("vision.video.diagnostics must be true or false")
@@ -95,6 +100,25 @@ def policy(config):
     for key in ("ffmpeg", "ffprobe"):
         if not isinstance(result[key], str) or not result[key] or any(c in result[key] for c in "\x00\r\n"):
             raise VideoError(f"vision.video.{key} must name an executable")
+    if "keyframes" in result and result["keyframes"] not in ("uniform", "hybrid"):
+        raise VideoError("vision.video.keyframes must be \"uniform\" or \"hybrid\"")
+    if "fit" in result and result["fit"] not in ("fixed", "budget"):
+        raise VideoError("vision.video.fit must be \"fixed\" or \"budget\"")
+    if "scene_threshold" in result:
+        value = result["scene_threshold"]
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) \
+                or not 0 < value <= 100:
+            raise VideoError("vision.video.scene_threshold must be greater than 0 and at most 100")
+    if "scene_share" in result:
+        value = result["scene_share"]
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) \
+                or not 0 < value < 1:
+            raise VideoError("vision.video.scene_share must be greater than 0 and less than 1")
+    if "scene_min_gap_s" in result:
+        value = result["scene_min_gap_s"]
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) \
+                or not 0 < value <= result["max_duration_s"]:
+            raise VideoError("vision.video.scene_min_gap_s must be positive and at most max_duration_s")
     return result
 
 
@@ -329,6 +353,212 @@ def _command(args, output, limit):
         raise VideoError(errors[0] if errors else "video codec rejected the input")
 
 
+def _nearest(times, target):
+    target = Decimal(str(target))
+    at = bisect.bisect_left(times, target)
+    candidates = [i for i in (at - 1, at) if 0 <= i < len(times)]
+    return min(candidates, key=lambda i: (abs(times[i] - target), i))
+
+
+def _uniform_indices(times, fps):
+    """The nearest source frame at every 1/fps step; earlier frame wins ties."""
+    fps = Decimal(str(fps))
+    chosen = set()
+    for k in range(math.floor(times[-1] * fps) + 1):
+        chosen.add(_nearest(times, Decimal(k) / fps))
+    return sorted(chosen | {len(times) - 1})
+
+
+def _pairs_from_indices(indices):
+    """Pair selected frames in order; the last pair may contain one frame."""
+    return [(indices[i], indices[i + 1] if i + 1 < len(indices) else indices[i])
+            for i in range(0, len(indices), 2)]
+
+
+def _flatten_pairs(pairs):
+    """Put disjoint pairs back into the one chronological frame list the packet stores."""
+    out = []
+    for a, b in sorted(pairs):
+        if out and a <= out[-1]:
+            continue                                # defensive: selection already filters overlaps
+        out.append(a)
+        if b != a:
+            out.append(b)
+    return out
+
+
+def _select_expression(indices):
+    """A balanced OR tree; a flat a+b+... chain hits FFmpeg's expression depth limit near 100 frames."""
+    terms = [f"eq(n\\,{index})" for index in indices]
+    while len(terms) > 1:
+        terms = [f"({terms[i]}+{terms[i + 1]})" if i + 1 < len(terms) else terms[i]
+                 for i in range(0, len(terms), 2)]
+    return terms[0]
+
+
+def _thin_pairs(pairs, limit):
+    """Keep the first and last pair and spread the rest evenly."""
+    if len(pairs) <= limit:
+        return list(pairs)
+    if limit <= 1:
+        return [pairs[-1]]
+    picks = [round(i * (len(pairs) - 1) / (limit - 1)) for i in range(limit)]
+    return [pairs[i] for i in dict.fromkeys(picks)]
+
+
+def _cut_pair(times, cut, fps):
+    """One pair centred on a cut, at the same time span as a uniform pair."""
+    fps = Decimal(str(fps))
+    half = Decimal("0.5") / fps
+    cut = Decimal(str(cut))
+    a = _nearest(times, max(Decimal(0), cut - half))
+    b = _nearest(times, min(times[-1], cut + half))
+    if b <= a:
+        at = bisect.bisect_left(times, cut)
+        a, b = max(0, at - 1), min(len(times) - 1, at)
+    if b <= a:
+        if a + 1 < len(times):
+            b = a + 1
+        elif a > 0:
+            a, b = a - 1, a
+        else:
+            return None
+    return a, b
+
+
+def _i_pair(times, index):
+    if index + 1 < len(times):
+        return index, index + 1
+    if index > 0:
+        return index - 1, index
+    return None
+
+
+def _overlaps(pair, selected):
+    a, b = pair
+    return any(a <= d and c <= b for c, d in selected)
+
+
+def _select_pairs(times, settings, rows, cuts=(), key_indices=()):
+    """Choose chronological, disjoint frame pairs within the frame and token budgets."""
+    fps = float(settings["fps"])
+    # Two frames per pair: an odd max_frames leaves the last slot unused rather
+    # than letting a 2-frame pair exceed the configured frame budget.
+    max_pairs = min(max(1, settings["max_frames"] // 2), settings["max_tokens"] // rows)
+    if max_pairs < 1:
+        raise VideoError("video exceeds its visual token budget; reduce pair_tokens or max_tokens")
+
+    effective = fps
+    if settings["max_frames"] < 2:
+        return [(len(times) - 1, len(times) - 1)], effective
+    uniform = _pairs_from_indices(_uniform_indices(times, effective))
+    if settings.get("fit", "fixed") == "budget" and len(uniform) > max_pairs:
+        duration = max(float(times[-1]), 1e-9)
+        # Each pair holds two frames, so the grid needs about duration * fps / 2
+        # pairs. Solve that for the FPS that fills the pair budget.
+        effective = max(1.0 / 60.0, min(fps, 2.0 * max_pairs / duration))
+        uniform = _pairs_from_indices(_uniform_indices(times, effective))
+        uniform = _thin_pairs(uniform, max_pairs)
+
+    if settings.get("keyframes", "uniform") == "uniform":
+        if len(uniform) > max_pairs:
+            raise VideoError("video exceeds selected frame budget; reduce duration or server FPS")
+        return uniform, effective
+
+    if max_pairs == 1:
+        selected = [(len(times) - 1, len(times) - 1)]
+    else:
+        first = (0, 1) if len(times) > 1 else (0, 0)
+        if len(times) <= 2:
+            last = first
+        elif len(times) == 3:
+            last = (2, 2)                 # a one-frame pair; the encoder duplicates it
+        else:
+            last = (len(times) - 2, len(times) - 1)
+        selected = [first] if first == last else [first, last]
+
+    scene_limit = max(0, int(max_pairs * float(settings.get("scene_share", 0.4))))
+    gap = float(settings.get("scene_min_gap_s", 0.5))
+    scene_pairs = []
+
+    for cut, _score in sorted(cuts, key=lambda c: (-c[1], c[0])):
+        if len(scene_pairs) >= scene_limit or len(selected) >= max_pairs:
+            break
+        pair = _cut_pair(times, cut, effective)
+        if pair is None or _overlaps(pair, selected):
+            continue
+        if any(abs(times[pair[0]] - times[s[0]]) < gap for s in scene_pairs):
+            continue
+        scene_pairs.append(pair)
+        selected.append(pair)
+
+    for index in sorted(key_indices):
+        if len(scene_pairs) >= scene_limit or len(selected) >= max_pairs:
+            break
+        pair = _i_pair(times, index)
+        if pair is None or _overlaps(pair, selected):
+            continue
+        if any(abs(times[pair[0]] - times[s[0]]) < gap for s in scene_pairs):
+            continue
+        scene_pairs.append(pair)
+        selected.append(pair)
+
+    for pair in uniform:
+        if len(selected) >= max_pairs:
+            break
+        if _overlaps(pair, selected):
+            continue
+        if any(abs(times[pair[0]] - times[s[0]]) < gap for s in scene_pairs):
+            continue
+        selected.append(pair)
+
+    return sorted(selected), effective
+
+
+def _scene_cuts(source_file, settings, common):
+    """FFmpeg's scene score at 320 px; an unsupported filter falls back to uniform."""
+    output = source_file.parent / "scenes.txt"
+    threshold = float(settings.get("scene_threshold", 10.0))
+    filt = f"scale=320:-2,scdet=threshold={threshold:g}:sc_pass=1,metadata=print:file=-"
+    try:
+        _command([settings["ffmpeg"], *common, "-threads", "1", "-i", str(source_file),
+                  "-map", "0:v:0", "-an", "-sn", "-dn", "-filter_threads", "1",
+                  "-vf", filt, "-f", "null", "-"], output, 1 << 20)
+    except (VideoError, OSError):
+        output.unlink(missing_ok=True)
+        print("[strata] video scene=fallback", file=sys.stderr, flush=True)
+        return []
+    try:
+        text = output.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        print("[strata] video scene=fallback", file=sys.stderr, flush=True)
+        return []
+    finally:
+        output.unlink(missing_ok=True)
+    cuts = {}
+    current = None
+    for line in text.splitlines():
+        if "pts_time:" in line:
+            match = re.search(r"pts_time:([0-9eE+.-]+)", line)
+            try:
+                current = float(match.group(1)) if match else None
+            except ValueError:
+                current = None
+            continue
+        match = re.search(r"lavfi\.scd\.score=([0-9eE+.-]+)", line)
+        if match and current is not None:
+            try:
+                score = float(match.group(1))
+            except ValueError:
+                score = 0.0
+            if math.isfinite(current) and math.isfinite(score) and current >= 0:
+                key = round(current, 6)
+                cuts[key] = max(score, cuts.get(key, 0.0))
+            current = None
+    print(f"[strata] video scene=cuts count={len(cuts)}", file=sys.stderr, flush=True)
+    return sorted(cuts.items())
+
+
 def _worker(request):
     directory = request.parent
     spec = json.loads(request.read_text(encoding="utf-8"))
@@ -390,7 +620,7 @@ def _worker(request):
     probe = directory / "probe.json"
     record_stage("decode")
     _command([p["ffprobe"], *common, "-threads", "1", "-select_streams", "v:0", "-show_frames", "-show_streams",
-              "-show_entries", "stream=width,height,duration,sample_aspect_ratio:stream_side_data=rotation:frame=best_effort_timestamp_time,width,height,duration_time,pkt_duration_time",
+              "-show_entries", "stream=width,height,duration,sample_aspect_ratio:stream_side_data=rotation:frame=key_frame,best_effort_timestamp_time,width,height,duration_time,pkt_duration_time",
               "-of", "json", str(source_file)], probe, 16 << 20)
     try:
         meta = json.loads(probe.read_text())
@@ -410,7 +640,8 @@ def _worker(request):
             raise VideoError("video timestamps must be finite and strictly increasing")
         if any(f["width"] != width or f["height"] != height for f in frames):
             raise VideoError("video resolution changes are not supported")
-        times = [t - times[0] for t in times]
+        origin = times[0]
+        times = [t - origin for t in times]
         tail = float(frames[-1].get("duration_time") or frames[-1].get("pkt_duration_time") or 0)
         declared = float(stream.get("duration") or 0)
         if not math.isfinite(tail) or not math.isfinite(declared) or tail < 0 or declared < 0:
@@ -423,28 +654,29 @@ def _worker(request):
         if isinstance(e, VideoError):
             raise
         raise VideoError("video metadata is missing or invalid") from None
-    # Nearest source PTS at a fixed grid; earlier frame wins ties. Always retain
-    # the last frame; reject excess cost instead of silently reducing cadence.
+    # The vision encoder turns each pair into one temporal patch. Select pairs
+    # before decoding so a scene cut cannot shift every later pair boundary.
     record_stage("sampling")
-    chosen = set()
-    fps = Decimal(str(p["fps"]))
-    for k in range(math.floor(times[-1] * fps) + 1):
-        target = Decimal(k) / fps
-        at = bisect.bisect_left(times, target)
-        candidates = [i for i in (at - 1, at) if 0 <= i < len(times)]
-        chosen.add(min(candidates, key=lambda i: (abs(times[i] - target), i)))
-    indices = sorted(chosen | {len(times) - 1})
-    if len(indices) > p["max_frames"]:
-        raise VideoError("video exceeds selected frame budget; reduce duration or server FPS")
     scale = min(1.0, math.sqrt(p["pair_tokens"] * 1024 / (width * height)))
     w, h = max(32, int(width * scale) // 32 * 32), max(32, int(height * scale) // 32 * 32)
     rows = w // 32 * (h // 32)
     size = w * h * 3
-    if rows > p["pair_tokens"] or rows * ((len(indices) + 1) // 2) > p["max_tokens"] \
+    cuts = []
+    if p.get("keyframes", "uniform") == "hybrid":
+        cuts = [(float(stamp) - float(origin), score) for stamp, score in _scene_cuts(source_file, p, common)]
+        cuts = [(stamp, score) for stamp, score in cuts if 0 <= stamp <= float(times[-1])]
+    key_indices = [i for i, frame in enumerate(frames) if frame.get("key_frame") == 1]
+    pairs, effective = _select_pairs(times, p, rows, cuts, key_indices)
+    indices = _flatten_pairs(pairs)
+    if len(indices) > p["max_frames"]:
+        raise VideoError("video exceeds selected frame budget; reduce duration or server FPS")
+    if rows > p["pair_tokens"] or rows * len(pairs) > p["max_tokens"] \
             or 16 + len(indices) * (8 + size) > 256 << 20:
         raise VideoError("video exceeds visual token or RGB budget")
+    print(f"[strata] video selected_pairs={len(pairs)} frames={len(indices)} "
+          f"effective_fps={effective:.6g}", file=sys.stderr, flush=True)
     raw = directory / "frames.rgb"
-    select = "+".join(f"eq(n\\,{i})" for i in indices)
+    select = _select_expression(indices)
     _command([p["ffmpeg"], *common, "-xerror", "-noautorotate", "-threads", "1", "-i", str(source_file),
               "-map", "0:v:0", "-an", "-sn", "-dn", "-filter_threads", "1", "-vf", f"select='{select}',scale={w}:{h}",
               "-fps_mode", "passthrough", "-threads", "1", "-pix_fmt", "rgb24", "-f", "rawvideo", "pipe:1"],
