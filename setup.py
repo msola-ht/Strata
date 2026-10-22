@@ -6325,6 +6325,12 @@ def engine_version(exe: Path) -> tuple:
     return tuple(int(x) for x in v.split(".")[:4] if x.isdigit())
 
 
+def engine_version_key(exe: Path) -> tuple:
+    """The installed engine's version padded like feed.version_key, so 0.1.47 and 0.1.47.0 compare equal."""
+    version = engine_version(exe)
+    return version + (0,) * (4 - len(version))
+
+
 def is_wsl() -> bool:
     return sys.platform.startswith("linux") and "microsoft" in platform.uname().release.lower()
 
@@ -6549,7 +6555,8 @@ def update_component_engines(have: list) -> bool:
                 package, reasons = feed.select_engine(candidates, hardware)
                 if package is None:
                     raise RuntimeError("no compatible engine in the update feed: " + "; ".join(reasons))
-                pending = [(p, c) for p, c in configs if engine_version(Path(c["exe"])) < feed.version_key(package.version)]
+                pending = [(p, c) for p, c in configs
+                           if engine_version_key(Path(c["exe"])) < feed.version_key(package.version)]
                 if not pending:
                     ok(f"installed {backend} engine is current ({package.version} or newer)")
                     continue
