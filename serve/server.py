@@ -5379,7 +5379,7 @@ class Service:
             with self.vision.temporary_directory("video-") as directory:
                 cached = getattr(self.embeddings, "cached_video", None)
                 if cached is None:
-                    packet = video_api.prepare(videos[0], directory, budget)
+                    packet, _sampling = video_api.prepare(videos[0], directory, budget)
                 with contextlib.ExitStack() as turn:
                     with budget.stage("encode_queue"):
                         turn.enter_context(video_api.acquire(self.fifo, budget))
@@ -5471,7 +5471,8 @@ class Service:
                         admitted = time.monotonic()
                         with vision.temporary_directory("video-cache-") as directory:
                             stage = "decode"
-                            packet = video_api.prepare("", directory, own_budget, local_file=source.path)
+                            packet, sampling = video_api.prepare(
+                                "", directory, own_budget, local_file=source.path)
                             decoded = time.monotonic()
                             stage = "queue"
                             with contextlib.ExitStack() as turn:
@@ -5499,7 +5500,7 @@ class Service:
                             print(f"[strata] video stage=preprocess queue_s={admitted-started:.3f} "
                                   f"decode_sampling_s={decoded-admitted:.3f} encode_queue_s={encoding-decoded:.3f} "
                                   f"encode_s={encoded-encoding:.3f}", flush=True)
-                            return layout
+                            return layout, sampling
                 except video_api.VideoError as e:
                     stage = getattr(e, "stage", stage)
                     suffix = "cancelled" if cancel.is_set() else "timeout" if time.monotonic() >= own_budget.deadline else "failed"
@@ -5509,9 +5510,11 @@ class Service:
             started = time.monotonic()
             with contextlib.ExitStack() as leases:
                 with budget.stage("cache_wait"):
-                    artifact, layout, hit = leases.enter_context(store.get_or_compute(
+                    artifact, layout, sampling, hit = leases.enter_context(store.get_or_compute(
                         key, budget, compute, producer_context=self.video_producer(source)))
                 print(f"[strata] video cache={hit} wait_s={time.monotonic()-started:.3f}", flush=True)
+                if hit != "miss" and budget.trace.enabled and sampling:
+                    budget.trace.data("sampling", sampling)
                 yield artifact, layout, identity
 
     PREFIX_END = "\u0001strata-prefix-end\u0001"          # marks where a message's shared part ends in the rendered prompt

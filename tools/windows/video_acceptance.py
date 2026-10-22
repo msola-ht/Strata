@@ -494,7 +494,8 @@ def sampling_summary(sampling: dict) -> str:
     return (f"mode={sampling.get('mode')} fit={sampling.get('fit')} "
             f"fps={sampling.get('fps')} effective_fps={sampling.get('effective_fps')} "
             f"pairs={sampling.get('pair_count')} frames={sampling.get('frame_count')} "
-            f"cuts={sampling.get('scene_cut_count')} fallback={sampling.get('scene_fallback')} "
+            f"cuts={sampling.get('scene_cut_count')} scan={sampling.get('scene_scan')} "
+            f"shots={sampling.get('shot_count')} fallback={sampling.get('scene_fallback')} "
             f"first={first} last={last}")
 
 
