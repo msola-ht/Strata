@@ -269,6 +269,7 @@ KEEPALIVE_S = 10.0          # a held-back tool argument leaves the stream quiet:
 # setup) makes them post /v1/v1/messages; these two paths mean the same as the real ones. Nothing else is aliased.
 V1_V1_ALIASES = {"/v1/v1/messages": "/v1/messages", "/v1/v1/messages/count_tokens": "/v1/messages/count_tokens"}
 CTX_SLACK = 8               # `strata --serve` rejects prompt + max_new + 8 > context: keep the same margin here
+VIDEO_TS_RESERVE = 1024     # timestamp text and vision markers for a prepared video prompt
 # The live tok/s is a rate over a window, not a mean since the first token: a mean reads ~1/elapsed at the first
 # token (the Monitor showed five-digit numbers) and then undershoots for the first second of every answer.
 RATE_WINDOW_S = 2.0
@@ -5362,6 +5363,12 @@ class Service:
         visual_room = ctx - CTX_SLACK - len(ids) - (max_new if max_new and max_new > 0 and not self.fit_max_tokens else 1)
         if visual_room < 1:
             raise video_api.VideoContextError("video request exceeds the context window before video preparation")
+        # The timestamp text and vision markers also live in the prompt. Leave
+        # room for them instead of preparing an artifact that cannot be inserted.
+        if visual_room <= VIDEO_TS_RESERVE:
+            raise video_api.VideoContextError(
+                "video request leaves too little context for timestamps; shorten the prompt or video")
+        budget.settings["max_tokens"] = min(budget.settings["max_tokens"], visual_room - VIDEO_TS_RESERVE)
         if isinstance(videos[0], dict):
             acquire_video = getattr(self.embeddings, "acquire_video", None)
             if acquire_video is None:
