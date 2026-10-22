@@ -161,6 +161,12 @@ class Trace:
             details = " ".join(f"{key}={value}" for key, value in fields.items())
             print(f"[strata] video trace={self.id} stage={stage} {details}", flush=True)
 
+    def data(self, stage, payload):
+        """One bounded JSON object, so a log reader never has to parse Python repr."""
+        if self.enabled:
+            details = json.dumps(payload, separators=(",", ":"), allow_nan=False)
+            print(f"[strata] video trace={self.id} stage={stage} data={details}", flush=True)
+
     @contextlib.contextmanager
     def stage(self, name, cancel=None, deadline=None, timeout_errors=()):
         started = time.monotonic()
@@ -209,7 +215,11 @@ def stop(proc):
 
 
 def prepare(source, directory, budget, *, local_file=None):
-    """One video per request: bounded source, packet and artifact disk ownership."""
+    """One video per request: bounded source, packet and artifact disk ownership.
+
+    Returns the SVF2 packet and the compact sampling metadata. The metadata is
+    kept even when diagnostics are off so a cache hit can still expose shots.
+    """
     settings = budget.settings
     if local_file is None and not source.startswith(("http://", "https://", "data:")):
         raise VideoError("video_url must be an http(s) or base64 data: URL; local paths are not accepted")
@@ -264,6 +274,24 @@ def prepare(source, directory, budget, *, local_file=None):
                     budget.current_stage = name
                     budget.trace.event(name, event="start")
 
+        def read_sampling():
+            path = directory / "sampling.json"
+            if not path.is_file():
+                return None
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                if not isinstance(payload, dict):
+                    raise ValueError("sampling metadata is not an object")
+            except (OSError, ValueError, TypeError):
+                budget.trace.event("sampling", diagnostics="unreadable")
+                return None
+            finally:
+                path.unlink(missing_ok=True)
+            if budget.trace.enabled:
+                budget.trace.data("sampling", payload)
+            return payload
+
+        sampling = None
         try:
             if os.name == "nt":
                 # Attach to the server's Job before the worker creates its nested per-request Job. Otherwise a
@@ -306,8 +334,9 @@ def prepare(source, directory, budget, *, local_file=None):
                     proc.stdin.close()
             stop(proc)
             request.unlink(missing_ok=True)
+            sampling = read_sampling()
             budget.current_stage = "preparation"
-    return directory / "frames.svf"
+    return directory / "frames.svf", sampling
 
 
 def _command(args, output, limit):
@@ -369,6 +398,18 @@ def _uniform_indices(times, fps):
     return sorted(chosen | {len(times) - 1})
 
 
+def _even_indices(times, count):
+    """Pick exactly count source frames, including both endpoints, in order."""
+    if count <= 0:
+        return []
+    if count >= len(times):
+        return list(range(len(times)))
+    if count == 1:
+        return [len(times) - 1]
+    step = Decimal(len(times) - 1) / Decimal(count - 1)
+    return [int(Decimal(index) * step + Decimal("0.5")) for index in range(count)]
+
+
 def _pairs_from_indices(indices):
     """Pair selected frames in order; the last pair may contain one frame."""
     return [(indices[i], indices[i + 1] if i + 1 < len(indices) else indices[i])
@@ -394,16 +435,6 @@ def _select_expression(indices):
         terms = [f"({terms[i]}+{terms[i + 1]})" if i + 1 < len(terms) else terms[i]
                  for i in range(0, len(terms), 2)]
     return terms[0]
-
-
-def _thin_pairs(pairs, limit):
-    """Keep the first and last pair and spread the rest evenly."""
-    if len(pairs) <= limit:
-        return list(pairs)
-    if limit <= 1:
-        return [pairs[-1]]
-    picks = [round(i * (len(pairs) - 1) / (limit - 1)) for i in range(limit)]
-    return [pairs[i] for i in dict.fromkeys(picks)]
 
 
 def _cut_pair(times, cut, fps):
@@ -457,8 +488,9 @@ def _select_pairs(times, settings, rows, cuts=(), key_indices=()):
         # Each pair holds two frames, so the grid needs about duration * fps / 2
         # pairs. Solve that for the FPS that fills the pair budget.
         effective = max(1.0 / 60.0, min(fps, 2.0 * max_pairs / duration))
-        uniform = _pairs_from_indices(_uniform_indices(times, effective))
-        uniform = _thin_pairs(uniform, max_pairs)
+        # Select the exact frame count instead of selecting a denser grid and
+        # deleting one interior pair. The latter leaves an uneven time gap.
+        uniform = _pairs_from_indices(_even_indices(times, min(len(times), 2 * max_pairs)))
 
     if settings.get("keyframes", "uniform") == "uniform":
         if len(uniform) > max_pairs:
@@ -527,12 +559,12 @@ def _scene_cuts(source_file, settings, common):
     except (VideoError, OSError):
         output.unlink(missing_ok=True)
         print("[strata] video scene=fallback", file=sys.stderr, flush=True)
-        return []
+        return [], True
     try:
         text = output.read_text(encoding="utf-8", errors="replace")
     except OSError:
         print("[strata] video scene=fallback", file=sys.stderr, flush=True)
-        return []
+        return [], True
     finally:
         output.unlink(missing_ok=True)
     cuts = {}
@@ -556,7 +588,43 @@ def _scene_cuts(source_file, settings, common):
                 cuts[key] = max(score, cuts.get(key, 0.0))
             current = None
     print(f"[strata] video scene=cuts count={len(cuts)}", file=sys.stderr, flush=True)
-    return sorted(cuts.items())
+    return sorted(cuts.items()), False
+
+
+def _merge_scene_cuts(cuts, minimum_gap):
+    """Collapse a burst of detections around one transition, keeping the strongest score."""
+    merged = []
+    for stamp, score in sorted(cuts):
+        if stamp <= 0:
+            continue
+        if merged and stamp - merged[-1][0] <= minimum_gap:
+            if score > merged[-1][1]:
+                merged[-1] = (stamp, score)
+            continue
+        merged.append((stamp, score))
+    return merged
+
+
+def _shots_from_cuts(cuts, duration, minimum_gap):
+    """Build half-open shot spans from merged cut candidates."""
+    if duration <= 0:
+        return []
+    merged = [item for item in _merge_scene_cuts(cuts, minimum_gap)
+              if item[0] < duration]
+    boundaries = [0.0, *(stamp for stamp, _score in merged), duration]
+    shots = []
+    for index in range(len(boundaries) - 1):
+        start, end = boundaries[index], boundaries[index + 1]
+        if end <= start:
+            continue
+        shots.append({
+            "index": len(shots),
+            "start": round(start, 6),
+            "end": round(end, 6),
+            "duration": round(end - start, 6),
+            "cut_score": round(merged[index - 1][1], 6) if index else None,
+        })
+    return shots
 
 
 def _worker(request):
@@ -650,6 +718,7 @@ def _worker(request):
             raise VideoError("video has no finite duration metadata")
         if max(float(times[-1]) + tail, declared) > p["max_duration_s"]:
             raise VideoError("video exceeds the duration budget")
+        media_end = max(float(times[-1]) + tail, declared)
     except (KeyError, TypeError, ValueError, OverflowError, InvalidOperation) as e:
         if isinstance(e, VideoError):
             raise
@@ -662,9 +731,13 @@ def _worker(request):
     rows = w // 32 * (h // 32)
     size = w * h * 3
     cuts = []
+    scene_fallback = False
+    scene_scan = "skipped"
     if p.get("keyframes", "uniform") == "hybrid":
-        cuts = [(float(stamp) - float(origin), score) for stamp, score in _scene_cuts(source_file, p, common)]
+        raw_cuts, scene_fallback = _scene_cuts(source_file, p, common)
+        cuts = [(float(stamp) - float(origin), score) for stamp, score in raw_cuts]
         cuts = [(stamp, score) for stamp, score in cuts if 0 <= stamp <= float(times[-1])]
+        scene_scan = "fallback" if scene_fallback else "ok"
     key_indices = [i for i, frame in enumerate(frames) if frame.get("key_frame") == 1]
     pairs, effective = _select_pairs(times, p, rows, cuts, key_indices)
     indices = _flatten_pairs(pairs)
@@ -675,6 +748,38 @@ def _worker(request):
         raise VideoError("video exceeds visual token or RGB budget")
     print(f"[strata] video selected_pairs={len(pairs)} frames={len(indices)} "
           f"effective_fps={effective:.6g}", file=sys.stderr, flush=True)
+    scene_times = [round(stamp, 6) for stamp, _score in cuts]
+    scene_scores = [round(score, 6) for _stamp, score in cuts]
+    shots = _shots_from_cuts(cuts, media_end, float(p.get("scene_min_gap_s", 0.5))) \
+        if scene_scan == "ok" else []
+    payload = {
+        "mode": p.get("keyframes", "uniform"),
+        "fit": p.get("fit", "fixed"),
+        "fps": float(p["fps"]),
+        "effective_fps": round(float(effective), 6),
+        "duration": round(media_end, 6),
+        "source_frames": len(times),
+        "pair_count": len(pairs),
+        "frame_count": len(indices),
+        "pairs": [[round(float(times[a]), 6), round(float(times[b]), 6)] for a, b in pairs],
+        "pair_midpoints": [round((float(times[a]) + float(times[b])) / 2, 6) for a, b in pairs],
+        "scene_scan": scene_scan,
+        "scene_fallback": scene_fallback,
+        "scene_cut_count": len(cuts),
+        "scene_cuts": scene_times[:256],
+        "scene_cut_scores": scene_scores[:256],
+        "scene_cuts_truncated": len(scene_times) > 256,
+        "shot_count": len(shots),
+        "shots": shots[:256],
+        "shots_truncated": len(shots) > 256,
+        "keyframe_count": len(key_indices),
+        "rows_per_pair": rows,
+    }
+    try:
+        (directory / "sampling.json").write_text(
+            json.dumps(payload, separators=(",", ":"), allow_nan=False), encoding="utf-8")
+    except OSError:
+        print("[strata] video sampling metadata could not be written", file=sys.stderr, flush=True)
     raw = directory / "frames.rgb"
     select = _select_expression(indices)
     _command([p["ffmpeg"], *common, "-xerror", "-noautorotate", "-threads", "1", "-i", str(source_file),

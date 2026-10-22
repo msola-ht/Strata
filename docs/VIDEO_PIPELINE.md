@@ -123,9 +123,11 @@ min(max_frames // 2, max_tokens // rows_per_pair)
 
 `rows_per_pair` is computed from the source size and `pair_tokens`, as before.
 If the uniform grid needs more pairs than the budget, the effective FPS is
-lowered until it fits, with the last frame retained. The trace reports the
-effective FPS. `fit: "fixed"` is the default and keeps the previous behaviour:
-excess frames are an error, never a silent cadence change.
+lowered until it fits. The budget path then picks the exact frame count evenly
+from the source, keeping both endpoints, so there is no interior pair to drop
+and no larger gap in the middle. The trace reports the effective FPS.
+`fit: "fixed"` is the default and keeps the previous behaviour: excess frames
+are an error, never a silent cadence change.
 
 The server also lowers `max_tokens` to the actual room left in the request
 context before preparing the video, leaving a small margin for timestamp text
@@ -148,7 +150,7 @@ defaults are unchanged.
 | `fit` | `"fixed"` | `"fixed"` or `"budget"`. |
 | `scene_threshold` | `10.0` | FFmpeg `scdet` threshold, 0 to 100. |
 | `scene_share` | `0.4` | Maximum share of pairs used by cut and I-frame pairs. |
-| `scene_min_gap_s` | `0.5` | Minimum start-time gap between scene pairs. |
+| `scene_min_gap_s` | `0.5` | Minimum start-time gap between scene pairs; also merges nearby shot candidates in diagnostics. |
 
 Example for a long, scene-heavy video:
 
@@ -169,6 +171,70 @@ Example for a long, scene-heavy video:
 A long video may also need a larger `max_source_bytes` and `deadline_s`; the
 defaults are sized for short uploads, and a 1080p ten-minute file can exceed
 64 MiB before decoding.
+
+### Diagnostics
+
+With `"diagnostics": true`, the server log gets one structured sampling line:
+
+```text
+[strata] video trace=<id> stage=sampling data={"mode":"hybrid",...}
+```
+
+The `data` object has `mode`, `fit`, `fps`, `effective_fps`, `duration`,
+`source_frames`, `pair_count`, `frame_count`, `pairs`, `pair_midpoints`,
+`scene_scan`, `scene_fallback`, `scene_cut_count`, `scene_cuts`,
+`scene_cut_scores`, `scene_cuts_truncated`, `shot_count`, `shots`,
+`shots_truncated`, `keyframe_count` and `rows_per_pair`. Pair and cut times are
+seconds from the first source timestamp.
+
+`scene_scan` is `"skipped"` when `keyframes` is `"uniform"`, `"fallback"` when
+the scene filter failed, and `"ok"` after a successful scan. A zero
+`scene_cut_count` therefore has no meaning by itself; read `scene_scan` first.
+`scene_cuts` are raw cut candidates and `scene_cut_scores` is the matching
+score list. `shots` merges candidates closer than `scene_min_gap_s`, keeps the
+strongest score in each burst, and reports `start`, `end`, `duration` and the
+cut score that opened the shot. `shot_count` is the number of merged shots,
+not the raw candidate count.
+
+`scene_cuts`, `scene_cut_scores`, and `shots` are each capped at 256 entries.
+The count and corresponding truncation flag describe the full result.
+Diagnostics never change the selected frames or the cache key.
+
+The Windows acceptance driver keeps the same object under
+`variants[].sampling` in `report.json`, and prints a short line in its summary:
+
+```text
+sampling/diagnostics: mode=hybrid fit=fixed fps=2.0 effective_fps=2.0 pairs=7 frames=14 cuts=2 scan=ok shots=3 fallback=False first=[0.0, 0.033333] last=[5.933333, 5.966667]
+```
+
+Use `variants[].sampling.pairs` for every selected frame pair,
+`variants[].sampling.scene_cuts` for raw candidates and
+`variants[].sampling.shots` for the merged timeline. Sampling metadata is
+stored with the video cache entry even when diagnostics are off. With
+diagnostics on, a cache hit can emit the same `stage=sampling` line without
+running FFmpeg again.
+
+### Opt-in shot context
+
+A `/v1/responses` request may ask the server to put the merged shot table in
+the user message:
+
+```json
+{
+  "video_analysis": {
+    "mode": "shots",
+    "max_shots": 64
+  }
+}
+```
+
+The table is inserted next to the video part after sampling, so the model sees
+the FFmpeg boundaries and does not have to infer them from the sampled frames.
+`max_shots` is a whole number from 1 to 256; its default is 64. The option is
+off by default. It only has an effect when `keyframes` is `hybrid` and the
+scene scan succeeded; otherwise the request continues without a shot table.
+The server reserves context space for the table before preparing the video, so
+enabling this option can reduce the video pair budget.
 
 ## Failure handling
 

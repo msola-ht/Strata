@@ -95,6 +95,7 @@ class _Cache:
     sha256: str
     deadline: float
     used: float
+    sampling: str = ""
     leases: int = 0
     retired: bool = False
 
@@ -412,15 +413,24 @@ class VideoStore:
                     flight.budget.check()
                     acquired = self._workers.acquire(timeout=0.1)
             flight.budget.check()
-            layout = compute(flight.budget, flight.path)
+            computed = compute(flight.budget, flight.path)
+            if isinstance(computed, tuple) and len(computed) == 2:
+                layout, sampling = computed
+            else:
+                layout, sampling = computed, None
             encoded = json.dumps(layout, separators=(",", ":"), allow_nan=False)
             if len(encoded.encode()) > 65536:
                 raise StoreError("invalid_request", "video layout exceeds its size budget")
+            encoded_sampling = json.dumps(sampling, separators=(",", ":"), allow_nan=False) \
+                if sampling is not None else ""
+            if len(encoded_sampling.encode()) > 65536:
+                raise StoreError("invalid_request", "video sampling metadata exceeds its size budget")
             with flight.budget.stage("checksum"):
                 size, digest = self._artifact_digest(flight.path, flight.budget.check)
             flight.budget.check()
             result = _Cache(flight.key, flight.path, encoded, size, digest,
-                            time.monotonic() + self.settings["cache_ttl_s"], time.monotonic())
+                            time.monotonic() + self.settings["cache_ttl_s"], time.monotonic(),
+                            sampling=encoded_sampling)
         except Exception as exc:
             if isinstance(exc, VideoError):
                 suffix = "cancelled" if flight.cancel.is_set() else \
@@ -471,11 +481,12 @@ class VideoStore:
     def get_or_compute(self, key, budget, compute, *, producer_context=None):
         """Join one producer; budget cancels only this waiter, never its peers.
 
-        compute(worker_budget, target_path) returns JSON-compatible layout, using
-        copy_artifact to publish embeddings. producer_context is entered before
-        the thread starts and closed by that thread, pinning its source independently
-        of the first waiter. Its Budget must also belong to the producer.
-        The yielded artifact is pinned: copy it into the request, never move it.
+        compute(worker_budget, target_path) returns a JSON-compatible layout or
+        ``(layout, sampling)``, using copy_artifact to publish embeddings.
+        producer_context is entered before the thread starts and closed by that
+        thread, pinning its source independently of the first waiter. Its Budget
+        must also belong to the producer. The yielded artifact is pinned: copy
+        it into the request, never move it.
         """
         if not isinstance(key, str) or len(key) != 64 or any(c not in "0123456789abcdef" for c in key):
             raise StoreError("invalid_request", "invalid video cache key")
@@ -548,7 +559,8 @@ class VideoStore:
                     self._retire_cache(entry)
                 raise
             try:
-                yield entry.path, json.loads(entry.layout), hit
+                sampling = json.loads(entry.sampling) if entry.sampling else None
+                yield entry.path, json.loads(entry.layout), sampling, hit
             except StoreError as error:
                 if error.code == "video_cache_corrupt":
                     with self._lock:

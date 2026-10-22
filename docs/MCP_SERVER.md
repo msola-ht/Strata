@@ -10,10 +10,11 @@
 - "Strata didn't start - what does the log say?"
 - "How fast is Strata on this PC?" (a short speed test)
 - "How do I connect Open WebUI / the OpenAI SDK / Claude Code to Strata?"
+- "Analyze this local video and describe each shot." (with `tools/strata_video_mcp.py`)
 
 The assistant calls the server's tools. The tools run Strata's own setup and start the model the way the start
-scripts do. It is one Python file that uses only the standard library, so it works before setup has created
-`.venv`. It needs Python 3.10 or newer, 64-bit on Windows.
+scripts do. The management server is one Python file that uses only the standard library, so it works before setup
+has created `.venv`. It needs Python 3.10 or newer, 64-bit on Windows.
 
 It is not the same thing as [Tools from MCP servers](DETAILS.md#tools-from-mcp-servers). That feature
 (`serve/mcp.py`) lets the *Strata model* call tools from your MCP servers in its chat page. This page is the other
@@ -117,8 +118,41 @@ The command is `python <Strata folder>/tools/strata_mcp.py`. The transport is st
 | `strata_logs` | The last lines of the server log, the engine log or the setup log. | `source` (server, engine, setup), `model`, `lines` (1-500) |
 | `strata_benchmark` | Sends a short fixed request (greedy, thinking off) and reports output and prompt tokens/s. | `port`, `max_tokens` (16-512) |
 | `strata_connect_info` | The OpenAI and Anthropic base URLs, the model id, whether a key is needed, and settings for Claude Code, Codex, the OpenAI SDK, curl, Cursor, Continue and Open WebUI. | `port` |
+| `strata_analyze_video` | Uploads a local video and asks the running model about it; `mode: "shots"` adds the FFmpeg shot table. | `path` or `file_id`, `question`, `mode` (shots/plain), `max_shots`, `max_output_tokens`, `port`, `timeout` |
 
-Every result is JSON with a one-line `summary`. It is sent both as text and as MCP structured content.
+`strata_analyze_video` is available in `tools/strata_video_mcp.py`; the
+management-only `tools/strata_mcp.py` does not list it. Every result is JSON
+with a one-line `summary`. It is sent both as text and as MCP structured
+content.
+
+### Video analysis
+
+The main `tools/strata_mcp.py` server stays management-only. For video, point
+the client at `tools/strata_video_mcp.py` instead. It offers the same tools
+plus `strata_analyze_video`:
+
+```bash
+claude mcp add strata -- python /path/to/Strata/tools/strata_video_mcp.py
+```
+
+Use the same JSON configuration as above, replacing the argument with
+`tools/strata_video_mcp.py`. Give the MCP client a long tool timeout, for
+example `tool_timeout_sec = 1800` in Codex, because decoding, encoding and
+generation can take several minutes.
+
+```json
+{
+  "path": "D:\\Strata-data\\videos\\example.mp4",
+  "question": "Describe each shot and what changes at the boundaries.",
+  "mode": "shots"
+}
+```
+
+The path must be inside the Strata folder or its configured data folder.
+After the first call, reuse the returned `file_id` for follow-up questions;
+the server can reuse its cached video artifact. A video upload remains until
+the server's normal file expiry, so the same file is not copied for every
+question.
 
 ## How it works
 
@@ -172,11 +206,15 @@ If a config of the folder sets an `api_key`, the tool sends that key with its ow
 - **No shell, no free paths.** Every argument is checked against a fixed schema and against setup's own choices. An
   unknown argument, a model or family setup does not offer, or a `gpus` value other than digits and commas is
   refused before anything runs. Commands are passed as argument lists; nothing goes through a shell.
-- **Paths.** The only path argument is `data_dir`. It must be one of:
+- **Paths.** `strata_install`'s `data_dir` must be one of these:
   - the current Strata data folder;
   - a folder inside the Strata folder;
   - a new absolute folder whose name starts with `Strata` (e.g. `D:\Strata-data`), whose parent exists, and which is
     not in a system folder.
+
+  `strata_analyze_video`'s video path must be an existing absolute file inside
+  the Strata folder or its current data folder. Symlinks are resolved before
+  the check.
 
   `..`, relative paths and network (UNC) paths are refused. Logs are read only from `.strata-mcp/` and from the
   engine log a config names, if that log is inside the Strata folder or the data folder.

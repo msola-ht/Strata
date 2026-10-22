@@ -101,6 +101,63 @@ def _content(content, param):
     return _parts_of(parts)
 
 
+def video_analysis_options(req: dict) -> dict | None:
+    """Validate the opt-in video shot context request."""
+    if not isinstance(req, dict):
+        return None
+    value = req.get("video_analysis")
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ResponsesError("video_analysis must be an object", "video_analysis")
+    if set(value) - {"mode", "max_shots"}:
+        raise ResponsesError("video_analysis has an unknown field", "video_analysis")
+    mode = value.get("mode", "shots")
+    if mode != "shots":
+        raise ResponsesError("video_analysis.mode must be \"shots\"", "video_analysis.mode")
+    max_shots = value.get("max_shots", 64)
+    if isinstance(max_shots, bool) or not isinstance(max_shots, int) or not 1 <= max_shots <= 256:
+        raise ResponsesError("video_analysis.max_shots must be a whole number from 1 to 256",
+                             "video_analysis.max_shots")
+    return {"mode": mode, "max_shots": max_shots}
+
+
+def add_video_shot_context(messages: list[dict], sampling: dict | None,
+                           max_shots: int = 64) -> tuple[list[dict], bool]:
+    """Insert the merged FFmpeg shot table next to the video part, if one is available."""
+    shots = sampling.get("shots") if isinstance(sampling, dict) else None
+    if not isinstance(shots, list) or not shots:
+        return messages, False
+    lines = ["Video shot boundaries from FFmpeg (seconds from the first frame):"]
+    shown = 0
+    for shot in shots[:max_shots]:
+        if not isinstance(shot, dict):
+            continue
+        start, end = shot.get("start"), shot.get("end")
+        if not isinstance(start, (int, float)) or not isinstance(end, (int, float)):
+            continue
+        lines.append(f"{shown}: {start:.3f}-{end:.3f}s")
+        shown += 1
+    if not shown:
+        return messages, False
+    if len(shots) > max_shots:
+        lines.append(f"Only the first {max_shots} of {len(shots)} shots are listed.")
+    lines.append("Describe visible content per shot; do not infer shot boundaries.")
+    text = "\n".join(lines)
+    result = copy.deepcopy(messages)
+    for message in result:
+        content = message.get("content")
+        if message.get("role") != "user" or not isinstance(content, list):
+            continue
+        video_at = next((i for i, part in enumerate(content)
+                         if isinstance(part, dict) and part.get("type") == "video"), None)
+        if video_at is None:
+            continue
+        content.insert(video_at + 1, {"type": "text", "text": text})
+        return result, True
+    return messages, False
+
+
 def _reasoning_text(item, param) -> str:
     """The thinking a reasoning item carries: its reasoning_text content, else our own encrypted_content.  A summary
     alone, or another server's encrypted_content, carries none that can go back into the prompt."""
@@ -508,6 +565,7 @@ def check_request(req: dict) -> None:
     reasoning = req.get("reasoning")
     if reasoning is not None and not isinstance(reasoning, dict):
         raise ResponsesError("reasoning must be an object", "reasoning")
+    video_analysis_options(req)
 
 
 def template_kwargs(req: dict, shared: dict) -> dict:
