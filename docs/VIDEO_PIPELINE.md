@@ -214,6 +214,28 @@ stored with the video cache entry even when diagnostics are off. With
 diagnostics on, a cache hit can emit the same `stage=sampling` line without
 running FFmpeg again.
 
+### Opt-in shot context
+
+A `/v1/responses` request may ask the server to put the merged shot table in
+the user message:
+
+```json
+{
+  "video_analysis": {
+    "mode": "shots",
+    "max_shots": 64
+  }
+}
+```
+
+The table is inserted next to the video part after sampling, so the model sees
+the FFmpeg boundaries and does not have to infer them from the sampled frames.
+`max_shots` is a whole number from 1 to 256; its default is 64. The option is
+off by default. It only has an effect when `keyframes` is `hybrid` and the
+scene scan succeeded; otherwise the request continues without a shot table.
+The server reserves context space for the table before preparing the video, so
+enabling this option can reduce the video pair budget.
+
 ## Failure handling
 
 - A scene pass that fails for a reason other than cancellation or timeout

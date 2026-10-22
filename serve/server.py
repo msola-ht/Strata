@@ -5350,6 +5350,11 @@ class Service:
             raise video_api.VideoError("video input is supported in user messages only")
         if self.vision is None or self.vision.video_policy is None:
             raise video_api.VideoError("video is disabled; enable vision.video.enabled and rebuild strata-vision")
+        analysis = responses_api.video_analysis_options(req)
+        shot_reserve = 0
+        if analysis and (self.vision.video_policy.get("keyframes", "uniform") == "hybrid"):
+            # Leave room for the merged shot table when it is inserted after sampling.
+            shot_reserve = 32 * analysis["max_shots"] + 128
         budget.check()
         ids = self.encode_prompt(messages, tools, kwargs)
         marker = self.tok.encode("<|vision_start|><|video_pad|><|vision_end|>", parse_special=True)
@@ -5365,10 +5370,12 @@ class Service:
             raise video_api.VideoContextError("video request exceeds the context window before video preparation")
         # The timestamp text and vision markers also live in the prompt. Leave
         # room for them instead of preparing an artifact that cannot be inserted.
-        if visual_room <= VIDEO_TS_RESERVE:
+        if visual_room <= VIDEO_TS_RESERVE + shot_reserve:
             raise video_api.VideoContextError(
-                "video request leaves too little context for timestamps; shorten the prompt or video")
-        budget.settings["max_tokens"] = min(budget.settings["max_tokens"], visual_room - VIDEO_TS_RESERVE)
+                "video request leaves too little context for timestamps and shot boundaries; "
+                "shorten the prompt or video")
+        budget.settings["max_tokens"] = min(
+            budget.settings["max_tokens"], visual_room - VIDEO_TS_RESERVE - shot_reserve)
         if isinstance(videos[0], dict):
             acquire_video = getattr(self.embeddings, "acquire_video", None)
             if acquire_video is None:
@@ -5378,8 +5385,9 @@ class Service:
         with contextlib.nullcontext():                  # the handler holds video_slot through generation
             with self.vision.temporary_directory("video-") as directory:
                 cached = getattr(self.embeddings, "cached_video", None)
+                sampling = None
                 if cached is None:
-                    packet, _sampling = video_api.prepare(videos[0], directory, budget)
+                    packet, sampling = video_api.prepare(videos[0], directory, budget)
                 with contextlib.ExitStack() as turn:
                     with budget.stage("encode_queue"):
                         turn.enter_context(video_api.acquire(self.fifo, budget))
@@ -5394,7 +5402,7 @@ class Service:
                                 output, _, layout = self.vision.encode_video(
                                     packet, Path(directory) / "video.sve", budget)
                     if cached is not None:
-                        artifact, layout, identity = cached
+                        artifact, layout, identity, sampling = cached
                         if identity != self.vision.video_identity:
                             raise video_api.VideoError("video encoder changed; retry the request")
                         try:
@@ -5407,6 +5415,15 @@ class Service:
                             while chunk := source.read(65536):
                                 budget.check()
                                 target.write(chunk)  # cache lease stays pinned; run() owns only this copy
+                    if analysis and sampling:
+                        messages, added = responses_api.add_video_shot_context(
+                            messages, sampling, analysis["max_shots"])
+                        if added:
+                            ids = self.encode_prompt(messages, tools, kwargs)
+                            marker = self.tok.encode("<|vision_start|><|video_pad|><|vision_end|>", parse_special=True)
+                            positions = [i for i in range(len(ids) - 2) if ids[i:i + 3] == marker]
+                            if len(positions) != 1:
+                                raise video_api.VideoError("the prompt and its video marker do not match")
                     replacement = []
                     for seconds, cells in layout:
                         replacement += self.tok.encode(f"<{seconds:.17g} seconds>", parse_special=False)
@@ -5515,7 +5532,7 @@ class Service:
                 print(f"[strata] video cache={hit} wait_s={time.monotonic()-started:.3f}", flush=True)
                 if hit != "miss" and budget.trace.enabled and sampling:
                     budget.trace.data("sampling", sampling)
-                yield artifact, layout, identity
+                yield artifact, layout, identity, sampling
 
     PREFIX_END = "\u0001strata-prefix-end\u0001"          # marks where a message's shared part ends in the rendered prompt
 

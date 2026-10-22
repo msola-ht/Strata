@@ -1753,6 +1753,10 @@ otherwise exceed `max_frames` or `max_tokens`, instead of refusing it. The model
 budget: the server lowers `max_tokens` to the room left in the request. The full chain, selection rules and failure
 handling are in [VIDEO_PIPELINE.md](VIDEO_PIPELINE.md).
 
+To let the model see the merged FFmpeg shot boundaries, add
+`"video_analysis": {"mode": "shots"}` to a `/v1/responses` request. This is opt-in and requires
+`"keyframes": "hybrid"`; the default prompt and video selection are unchanged.
+
 ### Sending a picture
 
 **Terminal chat:** type `/image <path to a picture>`, press Enter, then type your question.
